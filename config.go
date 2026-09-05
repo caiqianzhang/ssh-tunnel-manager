@@ -10,6 +10,7 @@ import (
 type ForwardConfig struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
+	ForwardType   string `json:"forward_type"` // "local" or "remote"
 	RemoteHost    string `json:"remote_host"`
 	RemotePort    int    `json:"remote_port"`
 	LocalHost     string `json:"local_host"`

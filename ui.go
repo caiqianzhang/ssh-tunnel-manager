@@ -21,14 +21,15 @@ type UI struct {
 	ssh    *SSHManager
 
 	// Form fields
-	nameEntry       widget.Editor
-	remoteHostEntry widget.Editor
-	remotePortEntry widget.Editor
-	localHostEntry  widget.Editor
-	localPortEntry  widget.Editor
-	sshUserEntry    widget.Editor
+	nameEntry        widget.Editor
+	remoteHostEntry  widget.Editor
+	remotePortEntry  widget.Editor
+	localHostEntry   widget.Editor
+	localPortEntry   widget.Editor
+	sshUserEntry     widget.Editor
 	sshPasswordEntry widget.Editor
-	autoReconnect   widget.Bool
+	autoReconnect    widget.Bool
+	forwardLocal     widget.Bool // true = local forwarding, false = remote forwarding
 
 	// Buttons
 	addBtn        widget.Clickable
@@ -64,6 +65,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.localPortEntry.SingleLine = true
 	u.sshUserEntry.SingleLine = true
 	u.sshPasswordEntry.SingleLine = true
+	u.forwardLocal.Value = true // Default to local forwarding
 	return u
 }
 
@@ -94,6 +96,7 @@ func (ui *UI) renderForm(gtx layout.Context) layout.Dimensions {
 	return layout.Inset{Left: 20, Right: 20, Top: 10, Bottom: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical, Spacing: 8}.Layout(gtx,
 			layout.Rigid(ui.renderEditorField(gtx, "Name:", &ui.nameEntry)),
+			layout.Rigid(ui.renderCheckBox("Local Forwarding (-L):", &ui.forwardLocal)),
 			layout.Rigid(ui.renderEditorField(gtx, "Remote Host:", &ui.remoteHostEntry)),
 			layout.Rigid(ui.renderEditorField(gtx, "Remote Port:", &ui.remotePortEntry)),
 			layout.Rigid(ui.renderEditorField(gtx, "Local Host:", &ui.localHostEntry)),
@@ -155,15 +158,20 @@ func (ui *UI) renderRuleList(gtx layout.Context) layout.Dimensions {
 			isSelected := index == ui.selectedIdx
 			status := ui.ssh.GetStatus(fwd.ID)
 
-			text := fmt.Sprintf("%s -> %s:%d via %s@%s [%s]",
-				fwd.Name, fwd.RemoteHost, fwd.RemotePort, fwd.SSHUser, fwd.LocalHost, status)
-
-			widget := material.Body1(ui.theme, text)
-			if isSelected {
-				widget.Color = color.NRGBA{R: 50, G: 100, B: 200, A: 255}
+			forwardType := "Local (-L)"
+			if fwd.ForwardType == "remote" {
+				forwardType = "Remote (-R)"
 			}
 
-			return layout.Inset{Top: 4, Bottom: 4}.Layout(gtx, widget.Layout)
+			text := fmt.Sprintf("[%s] %s -> %s:%d via %s@%s [%s]",
+				forwardType, fwd.Name, fwd.RemoteHost, fwd.RemotePort, fwd.SSHUser, fwd.LocalHost, status)
+
+			textWidget := material.Body1(ui.theme, text)
+			if isSelected {
+				textWidget.Color = color.NRGBA{R: 50, G: 100, B: 200, A: 255}
+			}
+
+			return layout.Inset{Top: 4, Bottom: 4}.Layout(gtx, textWidget.Layout)
 		})
 	})
 }
@@ -239,9 +247,15 @@ func (ui *UI) readFormInputs() (ForwardConfig, bool) {
 		localHost = "localhost"
 	}
 
+	forwardType := "local"
+	if !ui.forwardLocal.Value {
+		forwardType = "remote"
+	}
+
 	return ForwardConfig{
 		ID:            fmt.Sprintf("fwd_%d", time.Now().UnixNano()),
 		Name:          name,
+		ForwardType:   forwardType,
 		RemoteHost:    remoteHost,
 		RemotePort:    remotePort,
 		LocalHost:     localHost,
@@ -317,6 +331,7 @@ func (ui *UI) clearForm() {
 	ui.sshUserEntry.SetText("")
 	ui.sshPasswordEntry.SetText("")
 	ui.autoReconnect.Value = false
+	ui.forwardLocal.Value = true // Reset to local forwarding
 }
 
 // RunUI is the entry point called from main.go.

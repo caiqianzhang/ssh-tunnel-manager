@@ -92,9 +92,15 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 		return fmt.Errorf("no IPs found for host %s", cfg.RemoteHost)
 	}
 
+	// Determine forwarding flag based on type
+	forwardFlag := "-L" // Default to local forwarding
+	if cfg.ForwardType == "remote" {
+		forwardFlag = "-R"
+	}
+
 	// Create SSH command
 	args := []string{
-		"-R", fmt.Sprintf("%d:%s:%d", cfg.RemotePort, cfg.LocalHost, cfg.LocalPort),
+		forwardFlag, fmt.Sprintf("%d:%s:%d", cfg.LocalPort, cfg.RemoteHost, cfg.RemotePort),
 		"-N",
 		"-o", "ServerAliveInterval=60",
 		"-o", "ServerAliveCountMax=3",
@@ -137,8 +143,8 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	m.conns[cfg.ID] = sshConn
 	sshConn.Status = "running"
 
-	log.Printf("SSH tunnel started: %s -> %s:%d via %s (IP: %s)",
-		cfg.Name, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ips[0])
+	log.Printf("SSH tunnel started: %s (%s) -> %s:%d via %s (IP: %s)",
+		cfg.Name, forwardFlag, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ips[0])
 
 	// Start monitoring goroutine
 	go m.monitorProcess(cfg.ID)
@@ -235,9 +241,15 @@ func (m *SSHManager) autoReconnect(id string) {
 			continue
 		}
 
+		// Determine forwarding flag based on type
+		forwardFlag := "-L" // Default to local forwarding
+		if cfg.ForwardType == "remote" {
+			forwardFlag = "-R"
+		}
+
 		// Create SSH command
 		args := []string{
-			"-R", fmt.Sprintf("%d:%s:%d", cfg.RemotePort, cfg.LocalHost, cfg.LocalPort),
+			forwardFlag, fmt.Sprintf("%d:%s:%d", cfg.LocalPort, cfg.RemoteHost, cfg.RemotePort),
 			"-N",
 			"-o", "ServerAliveInterval=60",
 			"-o", "ServerAliveCountMax=3",
@@ -370,8 +382,13 @@ func (m *SSHManager) GetActiveConnections() []string {
 // FormatSSHCommand returns the SSH command that would be executed for a given config
 // Useful for debugging and testing
 func FormatSSHCommand(cfg ForwardConfig) string {
+	forwardFlag := "-L" // Default to local forwarding
+	if cfg.ForwardType == "remote" {
+		forwardFlag = "-R"
+	}
+
 	args := []string{
-		"-R", fmt.Sprintf("%d:%s:%d", cfg.RemotePort, cfg.LocalHost, cfg.LocalPort),
+		forwardFlag, fmt.Sprintf("%d:%s:%d", cfg.LocalPort, cfg.RemoteHost, cfg.RemotePort),
 		"-N",
 		"-o", "ServerAliveInterval=60",
 		"-o", "ServerAliveCountMax=3",
