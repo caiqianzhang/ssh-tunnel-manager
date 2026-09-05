@@ -19,6 +19,5 @@ func main() {
 }
 
 func run(w *app.Window) error {
-	// TODO: UI loop will be added in Task 5
-	return nil
+	return RunUI(w)
 }
