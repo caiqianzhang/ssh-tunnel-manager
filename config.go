@@ -15,6 +15,7 @@ type ForwardConfig struct {
 	LocalHost     string `json:"local_host"`
 	LocalPort     int    `json:"local_port"`
 	SSHUser       string `json:"ssh_user"`
+	SSHPassword   string `json:"ssh_password,omitempty"`
 	AutoReconnect bool   `json:"auto_reconnect"`
 	MaxRetries    int    `json:"max_retries"`
 	RetryInterval int    `json:"retry_interval"`

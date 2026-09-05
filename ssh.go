@@ -99,11 +99,25 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 		"-o", "ServerAliveInterval=60",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ExitOnForwardFailure=yes",
-		"-l", cfg.SSHUser,
-		cfg.RemoteHost,
+		"-o", "StrictHostKeyChecking=no",
 	}
 
-	cmd := exec.Command("ssh", args...)
+	// Use password authentication if provided
+	if cfg.SSHPassword != "" {
+		args = append(args, "-o", "PreferredAuthentications=password")
+		args = append(args, "-o", "PubkeyAuthentication=no")
+	}
+
+	args = append(args, "-l", cfg.SSHUser, cfg.RemoteHost)
+
+	var cmd *exec.Cmd
+	if cfg.SSHPassword != "" {
+		// Use sshpass for password authentication
+		args = append([]string{"-p", cfg.SSHPassword, "ssh"}, args...)
+		cmd = exec.Command("sshpass", args...)
+	} else {
+		cmd = exec.Command("ssh", args...)
+	}
 
 	// Create SSHConn
 	sshConn := &SSHConn{

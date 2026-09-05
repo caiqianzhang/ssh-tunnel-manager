@@ -27,6 +27,7 @@ type UI struct {
 	localHostEntry  widget.Editor
 	localPortEntry  widget.Editor
 	sshUserEntry    widget.Editor
+	sshPasswordEntry widget.Editor
 	autoReconnect   widget.Bool
 
 	// Buttons
@@ -62,6 +63,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.localHostEntry.SingleLine = true
 	u.localPortEntry.SingleLine = true
 	u.sshUserEntry.SingleLine = true
+	u.sshPasswordEntry.SingleLine = true
 	return u
 }
 
@@ -97,6 +99,7 @@ func (ui *UI) renderForm(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(ui.renderEditorField(gtx, "Local Host:", &ui.localHostEntry)),
 			layout.Rigid(ui.renderEditorField(gtx, "Local Port:", &ui.localPortEntry)),
 			layout.Rigid(ui.renderEditorField(gtx, "SSH User:", &ui.sshUserEntry)),
+			layout.Rigid(ui.renderEditorField(gtx, "SSH Password:", &ui.sshPasswordEntry)),
 			layout.Rigid(ui.renderCheckBox("Auto Reconnect:", &ui.autoReconnect)),
 		)
 	})
@@ -244,6 +247,7 @@ func (ui *UI) readFormInputs() (ForwardConfig, bool) {
 		LocalHost:     localHost,
 		LocalPort:     localPort,
 		SSHUser:       sshUser,
+		SSHPassword:   ui.sshPasswordEntry.Text(),
 		AutoReconnect: ui.autoReconnect.Value,
 	}, true
 }
@@ -311,6 +315,7 @@ func (ui *UI) clearForm() {
 	ui.localHostEntry.SetText("")
 	ui.localPortEntry.SetText("")
 	ui.sshUserEntry.SetText("")
+	ui.sshPasswordEntry.SetText("")
 	ui.autoReconnect.Value = false
 }
 
