@@ -71,7 +71,6 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 
 // Layout renders the complete UI and handles events.
 func (ui *UI) Layout(gtx layout.Context) layout.Dimensions {
-	ui.handleEvents(gtx)
 	return ui.buildLayout(gtx)
 }
 
@@ -356,8 +355,14 @@ func RunUI(w *app.Window) error {
 			return e.Err
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
+
+			// Handle events BEFORE layout
+			ui.handleEvents(gtx)
+
+			// Layout UI
 			ui.Layout(gtx)
-			e.Frame(&ops)
+
+			e.Frame(gtx.Ops)
 		}
 	}
 }

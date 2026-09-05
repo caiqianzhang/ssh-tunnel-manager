@@ -5,11 +5,14 @@ import (
 	"os"
 
 	"gioui.org/app"
+	"gioui.org/unit"
 )
 
 func main() {
 	go func() {
 		w := new(app.Window)
+		w.Option(app.Title("SSH Tunnel Manager"))
+		w.Option(app.Size(unit.Dp(600), unit.Dp(700)))
 		if err := run(w); err != nil {
 			log.Fatal(err)
 		}
