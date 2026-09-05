@@ -134,6 +134,7 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 
 // monitorProcess monitors an SSH process and handles auto-reconnect
 func (m *SSHManager) monitorProcess(id string) {
+	// Take a snapshot under lock
 	m.mu.RLock()
 	sshConn, exists := m.conns[id]
 	m.mu.RUnlock()
@@ -142,8 +143,16 @@ func (m *SSHManager) monitorProcess(id string) {
 		return
 	}
 
-	// Wait for the process to exit
+	// Wait for the process to exit (without holding any lock)
 	err := sshConn.Process.Wait()
+
+	// Check if we should stop monitoring
+	select {
+	case <-sshConn.StopCh:
+		// Stop was signaled, don't reconnect
+		return
+	default:
+	}
 
 	m.mu.Lock()
 	if _, stillExists := m.conns[id]; !stillExists {

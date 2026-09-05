@@ -202,23 +202,48 @@ func (ui *UI) getSelectedForward() *ForwardConfig {
 }
 
 func (ui *UI) readFormInputs() (ForwardConfig, bool) {
+	// Validate required fields
+	name := ui.nameEntry.Text()
+	if name == "" {
+		fmt.Println("Error: Name is required")
+		return ForwardConfig{}, false
+	}
+	remoteHost := ui.remoteHostEntry.Text()
+	if remoteHost == "" {
+		fmt.Println("Error: Remote host is required")
+		return ForwardConfig{}, false
+	}
+	sshUser := ui.sshUserEntry.Text()
+	if sshUser == "" {
+		fmt.Println("Error: SSH user is required")
+		return ForwardConfig{}, false
+	}
+
+	// Validate and parse ports
 	remotePort, err := strconv.Atoi(ui.remotePortEntry.Text())
-	if err != nil {
+	if err != nil || remotePort < 1 || remotePort > 65535 {
+		fmt.Println("Error: Remote port must be between 1 and 65535")
 		return ForwardConfig{}, false
 	}
 	localPort, err := strconv.Atoi(ui.localPortEntry.Text())
-	if err != nil {
+	if err != nil || localPort < 1 || localPort > 65535 {
+		fmt.Println("Error: Local port must be between 1 and 65535")
 		return ForwardConfig{}, false
+	}
+
+	localHost := ui.localHostEntry.Text()
+	if localHost == "" {
+		localHost = "localhost"
 	}
 
 	return ForwardConfig{
 		ID:            fmt.Sprintf("fwd_%d", time.Now().UnixNano()),
-		Name:          ui.nameEntry.Text(),
-		RemoteHost:    ui.remoteHostEntry.Text(),
+		Name:          name,
+		RemoteHost:    remoteHost,
 		RemotePort:    remotePort,
-		LocalHost:     ui.localHostEntry.Text(),
+		LocalHost:     localHost,
 		LocalPort:     localPort,
-		SSHUser:       ui.sshUserEntry.Text(),
+		SSHUser:       sshUser,
 		AutoReconnect: ui.autoReconnect.Value,
 	}, true
 }
