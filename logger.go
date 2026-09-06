@@ -18,6 +18,21 @@ type Logger struct {
 
 var globalLogger *Logger
 
+// maxLogSize is the size at which the log rotates to <path>.1,
+// overwriting the previous generation. A tray app runs for weeks; an
+// unbounded append-only log would grow forever.
+const maxLogSize = 5 << 20 // 5 MiB
+
+// rotateLogIfNeeded renames the current log to <path>.1 if it grew past
+// maxLogSize. Called before opening the log for a new session, so at
+// most two files (current + .1) ever exist.
+func rotateLogIfNeeded(path string) {
+	if info, err := os.Stat(path); err == nil && info.Size() >= maxLogSize {
+		_ = os.Remove(path + ".1")
+		_ = os.Rename(path, path+".1")
+	}
+}
+
 // InitLogger initializes the global logger, writing to a file in the user's config directory.
 // Returns the log file path on success.
 func InitLogger() (string, error) {
@@ -25,6 +40,8 @@ func InitLogger() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	rotateLogIfNeeded(logPath)
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {

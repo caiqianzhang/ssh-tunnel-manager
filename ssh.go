@@ -27,6 +27,13 @@ type SSHConn struct {
 	// retry sleep: the API just confirmed the server is up at its new
 	// IP, so waiting would only prolong the blackout. Guarded by the
 	// manager's mu.
+	//
+	// DDNSGen identifies the current DDNS-monitor generation. Every
+	// startDDNSMonitor call claims a new generation; older monitors
+	// retire themselves when they observe the bump (without this, a
+	// monitor that misses the brief non-running window around a
+	// reconnect would leak and keep polling the API forever).
+	DDNSGen     uint64
 	DDNSRestart bool
 	mu          sync.Mutex
 	StopCh      chan struct{}
@@ -41,6 +48,12 @@ type SSHManager struct {
 	// transitions. Guarded by mu; see SetOnStatusChange.
 	onStatusChange func(forwardID, status string)
 
+	// notifyCh serializes onStatusChange delivery: rapid transitions
+	// could otherwise reach the callback out of order (a stale
+	// "disconnected" arriving after the newest "connecting" would make
+	// the UI show a dead tunnel).
+	notifyCh chan notifyMsg
+
 	// commandBuilder creates the exec.Cmd for a forward. Defaults to
 	// buildSSHCommand; tests can override it to use a fake SSH binary
 	// (e.g. sleep) instead of spawning a real ssh process.
@@ -48,19 +61,49 @@ type SSHManager struct {
 
 	// ddnsCheckInterval is the period between Baidu DNS IP checks in
 	// startDDNSMonitor. Defaults to DefaultDDNSIntervalSeconds (15s);
-	// the config file and tests can override it.
+	// the config file and tests can override it (via
+	// SetDDNSCheckInterval — the field is guarded by mu).
 	ddnsCheckInterval time.Duration
+}
+
+// notifyMsg is one status transition queued for serialized dispatch.
+type notifyMsg struct {
+	id     string
+	status string
 }
 
 // NewSSHManager creates a new SSHManager
 func NewSSHManager() *SSHManager {
-	return &SSHManager{
+	m := &SSHManager{
 		conns: make(map[string]*SSHConn),
 		commandBuilder: func(cfg ForwardConfig, host string) *exec.Cmd {
 			return buildSSHCommand(cfg, host)
 		},
 		ddnsCheckInterval: time.Duration(DefaultDDNSIntervalSeconds) * time.Second,
+		notifyCh:          make(chan notifyMsg, 64),
 	}
+	// Serialized dispatcher: callbacks observe transitions in the order
+	// they happened, one goroutine for the manager's lifetime.
+	go func() {
+		for msg := range m.notifyCh {
+			m.mu.RLock()
+			fn := m.onStatusChange
+			m.mu.RUnlock()
+			if fn != nil {
+				fn(msg.id, msg.status)
+			}
+		}
+	}()
+	return m
+}
+
+// SetDDNSCheckInterval sets the DDNS heartbeat period. Safe to call
+// from any goroutine; a ticker already running finishes its current
+// cycle with the old value.
+func (m *SSHManager) SetDDNSCheckInterval(d time.Duration) {
+	m.mu.Lock()
+	m.ddnsCheckInterval = d
+	m.mu.Unlock()
 }
 
 // buildCmd creates the exec.Cmd for a forward using the configured
@@ -83,18 +126,25 @@ func (m *SSHManager) SetOnStatusChange(fn func(forwardID, status string)) {
 	m.mu.Unlock()
 }
 
-// notifyStatus dispatches a status transition to the registered
-// callback. Safe to call while holding m.mu: the callback is invoked
-// from a separate goroutine once the lock has been released.
+// notifyStatus queues a status transition for serialized dispatch to
+// the registered callback. Safe to call while holding m.mu: the
+// callback is invoked from the dispatcher goroutine.
 func (m *SSHManager) notifyStatus(forwardID, status string) {
-	go func() {
-		m.mu.RLock()
-		fn := m.onStatusChange
-		m.mu.RUnlock()
-		if fn != nil {
-			fn(forwardID, status)
+	select {
+	case m.notifyCh <- notifyMsg{id: forwardID, status: status}:
+	default:
+		// Queue full (pathologically slow consumer): drop the oldest
+		// entry and retry once — the newest state is the one that
+		// matters for the UI.
+		select {
+		case <-m.notifyCh:
+		default:
 		}
-	}()
+		select {
+		case m.notifyCh <- notifyMsg{id: forwardID, status: status}:
+		default:
+		}
+	}
 }
 
 // FlushDNS clears the local DNS cache
@@ -393,9 +443,10 @@ func buildSSHCommand(cfg ForwardConfig, host string) *exec.Cmd {
 // attachPasswordPipe sets up a pipe carrying the SSH password to
 // sshpass via file descriptor 3, so the credential never appears in
 // the process command line (ps, /proc/<pid>/cmdline). Returns the
-// read end, which the caller must close if Start fails; on success
-// Go closes the parent's copy of the ExtraFiles entry after the
-// child starts (see os/exec exec.go: closeDescriptors).
+// read end, which the CALLER must close right after a successful
+// Start: os/exec does not close caller-provided ExtraFiles, and an
+// unclosed read end would leak one fd per connection until GC
+// finalizers run. If Start fails, close it immediately instead.
 func attachPasswordPipe(cmd *exec.Cmd, password string) (*os.File, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -499,6 +550,12 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 			pwRead.Close()
 		}
 		return fmt.Errorf("failed to start SSH process: %v", err)
+	}
+	if pwRead != nil {
+		// The child holds its own dup of the pipe now; our copy would
+		// otherwise linger until GC finalizers run (one leaked fd per
+		// password-authenticated connection).
+		pwRead.Close()
 	}
 
 	// Store connection. Re-check existence under the lock first: another
@@ -631,6 +688,16 @@ func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost st
 	if interval <= 0 {
 		interval = time.Duration(DefaultDDNSIntervalSeconds) * time.Second
 	}
+	// Claim a monitor generation. An older monitor still ticking for
+	// this connection (e.g. one started before the last reconnect)
+	// observes the bump and retires itself — without this, every
+	// reconnect whose non-running window is shorter than one tick
+	// leaks a heartbeat that keeps polling the API and can kill the
+	// newer tunnel.
+	m.mu.Lock()
+	sshConn.DDNSGen++
+	gen := sshConn.DDNSGen
+	m.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -639,20 +706,33 @@ func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost st
 			case <-sshConn.StopCh:
 				return
 			case <-ticker.C:
-				// If the tunnel is no longer running (process exited,
-				// handleProcessExit already fired, autoReconnect is
-				// underway with its own heartbeat), stop monitoring.
+				// Snapshot under the lock: gen, status and the IP the
+				// tunnel is currently connected to.
 				m.mu.RLock()
+				genOK := sshConn.DDNSGen == gen
 				status := sshConn.Status
 				currentIP := sshConn.CurrentIP
 				m.mu.RUnlock()
-				if status != "running" {
+				// A newer monitor took over (reconnect happened): this
+				// one is obsolete, stop polling.
+				if !genOK || status != "running" {
 					return
 				}
 
 				ip, ok := ResolveRealIP(remoteHost)
 				if !ok {
 					continue
+				}
+
+				// Re-check AFTER the (up to 10s) network call: the
+				// earlier snapshot may be stale — a reconnect may have
+				// published a new process/IP, or a newer monitor may
+				// have taken over. Acting on the stale snapshot could
+				// kill a healthy tunnel.
+				m.mu.Lock()
+				if sshConn.DDNSGen != gen || sshConn.Status != "running" || sshConn.CurrentIP != currentIP {
+					m.mu.Unlock()
+					return
 				}
 				if ip != currentIP {
 					Logf("DDNS heartbeat: IP changed %s → %s for %s, restarting tunnel",
@@ -662,14 +742,15 @@ func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost st
 					// to skip the retry sleep (the fresh IP is already
 					// confirmed authoritative, so there is nothing to
 					// wait for).
-					m.mu.Lock()
 					sshConn.DDNSRestart = true
+					proc := sshConn.Process
 					m.mu.Unlock()
-					if sshConn.Process != nil && sshConn.Process.Process != nil {
-						_ = sshConn.Process.Process.Kill()
+					if proc != nil && proc.Process != nil {
+						_ = proc.Process.Kill()
 					}
 					return
 				}
+				m.mu.Unlock()
 				Logf("DDNS heartbeat: IP OK %s for %s", ip, id)
 			}
 		}
@@ -695,18 +776,13 @@ func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 		Logf("SSH process for %s exited normally", id)
 	}
 
-	// Log stderr output for diagnostics. Truncate it: full stderr can
-	// contain credentials (password prompts) or other sensitive data,
-	// and it is written to a log file that may be world-readable.
 	stderr := sshConn.Stderr.String()
-	if stderr != "" {
-		if len(stderr) > 200 {
-			stderr = stderr[:200] + "..."
-		}
-		Logf("SSH stderr for %s: %s", id, stderr)
-	}
 
-	// Check for specific error types
+	// Classify against the FULL stderr: ssh prints banners/kex noise
+	// first, and truncating before classification could cut the needle
+	// ("Permission denied", "Address already in use") out of the haystack
+	// — a missed auth failure used to keep retrying and hammering the
+	// server's password limit.
 	status := "disconnected"
 	shouldReconnect := true
 
@@ -724,6 +800,15 @@ func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 	} else if strings.Contains(stderr, "No route to host") {
 		status = "unreachable"
 		Logf("Host unreachable for %s - check network connectivity", id)
+	}
+
+	// Log at most 200 bytes of stderr: it can contain credential prompts
+	// or other sensitive output, and the log file may be world-readable.
+	if stderr != "" {
+		if len(stderr) > 200 {
+			stderr = stderr[:200] + "..."
+		}
+		Logf("SSH stderr for %s: %s", id, stderr)
 	}
 
 	sshConn.Status = status
@@ -834,6 +919,10 @@ func (m *SSHManager) autoReconnect(id string, ddnsTriggered bool) {
 			}
 			Logf("Failed to start SSH process on attempt %d: %v", i+1, err)
 			continue
+		}
+		if pwRead != nil {
+			// Same fd-hygiene as Connect: the child owns the pipe now.
+			pwRead.Close()
 		}
 
 		// Start succeeded — publish the new process and status. Re-check

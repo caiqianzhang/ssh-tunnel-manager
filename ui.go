@@ -103,6 +103,7 @@ type UI struct {
 	// running. We use it to swallow repeat clicks that would otherwise
 	// spawn duplicate SSH processes or double-kill the same PID.
 	conflictBusy   bool
+	connectBusy    bool
 	newPortEntry   widget.Editor
 	killProcessBtn widget.Clickable
 	changePortBtn  widget.Clickable
@@ -131,11 +132,14 @@ type uiCmd func()
 
 // queueUIFunc appends f to the pending UI-command queue. Safe to call
 // from any goroutine; the event loop drains the queue on the UI thread
-// via drainUICmds.
+// via drainUICmds. Also requests a frame: Gio only paints in response
+// to events, so without an Invalidate a queued mutation (an error
+// banner, a dialog) would sit invisible until the next input event.
 func (ui *UI) queueUIFunc(f uiCmd) {
 	ui.uiCmdMu.Lock()
 	ui.uiCmdQ = append(ui.uiCmdQ, f)
 	ui.uiCmdMu.Unlock()
+	invalidateWindow()
 }
 
 // drainUICmds runs every pending UI command on the current (UI) thread.
@@ -281,6 +285,7 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	ui.sshUserEntry.Update(gtx)
 	ui.sshPasswordEntry.Update(gtx)
 	ui.apiKeyEntry.Update(gtx)
+	ui.ddnsIntervalEntry.Update(gtx)
 	ui.newPortEntry.Update(gtx)
 
 	// Snapshot testing under the lock: testAPI writes it from a
@@ -366,6 +371,15 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 // DNS resolution and SSH start cannot freeze the UI; results arrive
 // later via setTestResult / showPortConflictDialog.
 func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
+	// Re-entrancy guard (UI thread): a double-click — or a click racing
+	// autoConnect — must not enqueue two racing connect attempts that
+	// both pass the 150ms port check. Without the guard the loser
+	// reports "连接失败: connection already exists" while the tunnel
+	// actually came up.
+	if ui.connectBusy {
+		return
+	}
+
 	// Fast path: already running — disconnect synchronously.
 	status := ui.ssh.GetStatus(fwd.ID)
 	if status == "running" {
@@ -386,8 +400,11 @@ func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 	// Show "connecting" immediately so the user gets feedback while
 	// the port check + SSH start happen in the background.
 	ui.setTestResult("连接中...", true)
+	ui.connectBusy = true
 
 	go func() {
+		defer ui.queueUIFunc(func() { ui.connectBusy = false })
+
 		inUse, processInfo, err := ui.portChecker(fwd.LocalPort)
 		if err != nil {
 			fmt.Println("Port check error:", err)
@@ -460,24 +477,31 @@ func (ui *UI) handleKillProcess() {
 	fwd := forwards[0]
 	Logf("UI.handleKillProcess: attempting to kill process on port %d", fwd.LocalPort)
 
-	// Kill the process
-	if err := KillProcessByPort(fwd.LocalPort); err != nil {
-		Logf("UI.handleKillProcess: kill failed: %v", err)
-		ui.setTestResult(fmt.Sprintf("结束进程失败: %v", err), false)
-		ui.showPortConflictDialog = false
-		ui.conflictBusy = false
-		return
-	}
-
-	Logf("UI.handleKillProcess: process killed, attempting to connect to port %d", fwd.LocalPort)
-	ui.setTestResult("进程已结束，正在连接...", true)
-	ui.showPortConflictDialog = false
-
-	// Try to connect asynchronously so the UI does not freeze during
-	// DNS resolution / SSH start. conflictBusy stays true until the
-	// connect finishes so repeat clicks cannot spawn a second tunnel;
-	// the release is queued for the UI thread via queueUIFunc.
+	// Kill + reconnect OFF the UI thread: KillProcessByPort can run a
+	// whole escalation chain of external commands (ss / kill / sudo
+	// kill / fuser / lsof), each with blocking waits — running it on
+	// the event-loop thread would freeze the frame for seconds.
+	// conflictBusy already covers the whole kill+connect section.
 	go func() {
+		if err := KillProcessByPort(fwd.LocalPort); err != nil {
+			Logf("UI.handleKillProcess: kill failed: %v", err)
+			ui.queueUIFunc(func() {
+				ui.setTestResult(fmt.Sprintf("结束进程失败: %v", err), false)
+				ui.showPortConflictDialog = false
+				ui.conflictBusy = false
+			})
+			return
+		}
+
+		Logf("UI.handleKillProcess: process killed, attempting to connect to port %d", fwd.LocalPort)
+		ui.queueUIFunc(func() {
+			ui.setTestResult("进程已结束，正在连接...", true)
+			ui.showPortConflictDialog = false
+		})
+
+		// Try to connect asynchronously so the UI does not freeze during
+		// DNS resolution / SSH start. conflictBusy stays true until the
+		// connect finishes so repeat clicks cannot spawn a second tunnel.
 		if err := ui.ssh.Connect(fwd); err != nil {
 			Logf("UI.handleKillProcess: connect failed after kill: %v", err)
 			ui.queueUIFunc(func() { ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false) })
@@ -672,7 +696,6 @@ func (ui *UI) saveSettings() {
 		id = forwards[0].ID
 		existing = forwards[0]
 		hadExisting = true
-		ui.config.DeleteForward(id)
 	} else {
 		id = fmt.Sprintf("fwd_%d", time.Now().UnixNano())
 	}
@@ -680,15 +703,21 @@ func (ui *UI) saveSettings() {
 	// Bug 3: preserve MaxRetries/RetryInterval from the existing
 	// forward, otherwise default to 5/5. We also preserve SSHPassword
 	// when the user left the field empty (avoids wiping a stored pw
-	// because the form is unmasked).
+	// because the form is unmasked) and the custom Name. The forward is
+	// updated in place (UpdateForward) instead of delete+re-add, so a
+	// failed Save can never leave memory and disk diverging.
 	maxRetries := 5
 	retryInterval := 5
+	name := "default"
 	if hadExisting {
 		if existing.MaxRetries > 0 {
 			maxRetries = existing.MaxRetries
 		}
 		if existing.RetryInterval > 0 {
 			retryInterval = existing.RetryInterval
+		}
+		if existing.Name != "" {
+			name = existing.Name
 		}
 		// Only preserve the stored password if the user did not type
 		// anything in the password field (which is masked, so we can't
@@ -699,9 +728,9 @@ func (ui *UI) saveSettings() {
 		}
 	}
 
-	ui.config.AddForward(ForwardConfig{
+	updated := ForwardConfig{
 		ID:            id,
-		Name:          "default",
+		Name:          name,
 		ForwardType:   forwardType,
 		RemoteHost:    remoteHost,
 		RemotePort:    remotePort,
@@ -712,7 +741,12 @@ func (ui *UI) saveSettings() {
 		AutoReconnect: ui.autoReconnect.Value,
 		MaxRetries:    maxRetries,
 		RetryInterval: retryInterval,
-	})
+	}
+	if hadExisting {
+		ui.config.UpdateForward(id, updated)
+	} else {
+		ui.config.AddForward(updated)
+	}
 
 	// Save API key
 	ui.config.SetAPIKey(strings.TrimSpace(ui.apiKeyEntry.Text()))
@@ -728,7 +762,7 @@ func (ui *UI) saveSettings() {
 	// now on use the new period (a heartbeat already ticking finishes
 	// its current cycle first).
 	if ddnsInterval > 0 {
-		ui.ssh.ddnsCheckInterval = time.Duration(ddnsInterval) * time.Second
+		ui.ssh.SetDDNSCheckInterval(time.Duration(ddnsInterval) * time.Second)
 	}
 
 	// Bug 5: report save failure to the user and keep them on the

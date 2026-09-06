@@ -32,14 +32,14 @@ lets you connect, disconnect and restore the window.
 
 ## Build & run
 
-Requirements: Go 1.24+, an SSH client in `PATH`, and `sshpass` if you
+Requirements: Go 1.26+, an SSH client in `PATH`, and `sshpass` if you
 use password authentication (key-based auth also works).
 
 ```sh
-make build            # Linux binary -> ./ssh-tunnel-manager
-make build-windows    # Windows binary -> ./ssh-tunnel-manager.exe
+make build            # Linux binary -> build/ssh-tunnel-manager
+make build-windows    # Windows binary -> build/ssh-tunnel-manager.exe
 make test
-./ssh-tunnel-manager
+./build/ssh-tunnel-manager
 ```
 
 ## Configuration
@@ -53,7 +53,8 @@ per-user cache directory.
 
 A template with placeholder values is committed as `config.example.json`.
 Copy it to `config.json` (it is created automatically on first run) and
-edit the values before connecting.
+edit the values before connecting. `settings.api_key` is the Anthropic
+API key sent through the tunnel by the in-app 测试 button (optional).
 
 ## Project layout
 

@@ -53,6 +53,11 @@ type ConfigManager struct {
 	mu       sync.RWMutex
 	filePath string
 	state    AppState
+	// readOnly is set when the existing config could not be loaded
+	// (corrupt file, missing secret key). Saving would then overwrite
+	// the on-disk config with in-memory defaults — an unrecoverable
+	// data-loss chain — so Save refuses while the flag is set.
+	readOnly bool
 }
 
 // NewConfigManager creates a new ConfigManager with the specified file path
@@ -99,10 +104,15 @@ func (cm *ConfigManager) Load() error {
 }
 
 // Save saves the current configuration to the JSON file. Encrypts
-// SSHPassword and APIKey fields before writing.
+// SSHPassword and APIKey fields before writing. Refuses to write when
+// the manager is in read-only protection (see SetReadOnly).
 func (cm *ConfigManager) Save() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+
+	if cm.readOnly {
+		return fmt.Errorf("配置未能成功加载，已进入只读保护；请先修复配置文件，避免覆盖原数据")
+	}
 
 	// Build an encrypted copy so we don't mutate in-memory state.
 	snapshot := AppState{
@@ -256,6 +266,15 @@ func DefaultConfig() AppState {
 		Forwards: []ForwardConfig{},
 		Settings: AppSettings{},
 	}
+}
+
+// SetReadOnly toggles read-only protection (see Save). Used by main
+// when the initial Load fails: the on-disk config is likely fine, the
+// app just could not read it, so overwriting must be prevented.
+func (cm *ConfigManager) SetReadOnly(ro bool) {
+	cm.mu.Lock()
+	cm.readOnly = ro
+	cm.mu.Unlock()
 }
 
 // GetAPIKey returns the configured API key

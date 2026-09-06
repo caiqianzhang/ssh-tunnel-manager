@@ -41,11 +41,30 @@ func currentUI() *UI {
 	return appUI
 }
 
+// invalidateWindow requests a repaint if a window is currently alive.
+// Safe to call from any goroutine; a no-op in tray mode.
+func invalidateWindow() {
+	winMu.Lock()
+	w, alive := curWin, winAlive
+	winMu.Unlock()
+	if alive {
+		w.Invalidate()
+	}
+}
+
 func main() {
 	// Only one instance may run: a second one would conflict with the
 	// tunnels of the first and confuse the user.
 	lockFile, err := acquireSingleInstanceLock()
 	if err != nil {
+		// Another instance owns the lock: poke it to raise its window
+		// instead of failing silently — a desktop double-click must
+		// never be a no-op. (The wake socket can only be reached while
+		// the lock holder is alive, which is exactly this case.)
+		if notifyRunningInstance() {
+			fmt.Fprintln(os.Stderr, "ssh-tunnel-manager: 已通知正在运行的实例显示窗口")
+			return
+		}
 		fmt.Fprintln(os.Stderr, "ssh-tunnel-manager:", err)
 		return
 	}
@@ -68,10 +87,8 @@ func main() {
 
 	// A second launch (e.g. double-clicking the binary again) wakes
 	// the running instance instead of starting a competing process.
-	if notifyRunningInstance() {
-		fmt.Fprintln(os.Stderr, "ssh-tunnel-manager: 已通知正在运行的实例显示窗口")
-		return
-	}
+	// (Handled in the lock-failure branch above — the wake socket can
+	// only exist while another instance holds the lock.)
 
 	showCh := make(chan struct{}, 1)
 	quitCh := make(chan struct{}, 1)
@@ -86,8 +103,13 @@ func main() {
 	cfg := NewConfigManager(configPath)
 	if err := cfg.Load(); err != nil {
 		if !isNotExist(err) {
+			// The on-disk config is probably fine (corrupt file, missing
+			// secret key, ...). Mark the manager read-only: saving from
+			// the half-loaded in-memory state would overwrite the file
+			// and destroy the user's real config.
 			log.Printf("Failed to load config: %v", err)
-			Logf("runAppLoop: failed to load config: %v", err)
+			Logf("runAppLoop: failed to load config: %v — read-only protection enabled", err)
+			cfg.SetReadOnly(true)
 		} else {
 			Log("config file not found, using defaults")
 		}
@@ -98,19 +120,14 @@ func main() {
 	// (settings.ddns_check_interval, seconds); 0/unset keeps the
 	// built-in default of 15s.
 	if s := cfg.GetDDNSCheckInterval(); s > 0 {
-		sshMgr.ddnsCheckInterval = time.Duration(s) * time.Second
+		sshMgr.SetDDNSCheckInterval(time.Duration(s) * time.Second)
 		Logf("DDNS probe interval set to %ds from config", s)
 	}
 
 	// Repaint immediately on tunnel status transitions instead of
 	// waiting for the next interaction-driven frame.
 	sshMgr.SetOnStatusChange(func(forwardID, status string) {
-		winMu.Lock()
-		w, alive := curWin, winAlive
-		winMu.Unlock()
-		if alive {
-			w.Invalidate()
-		}
+		invalidateWindow()
 	})
 
 	// Tray show-request consumer. A live window — even minimized — is
@@ -129,6 +146,18 @@ func main() {
 		}
 	}()
 
+	// Tray quit and external signals share one shutdown path. The Once
+	// guarantees that a second arrival (tray quit racing SIGTERM)
+	// cannot cut the first one's DisconnectAll short with os.Exit.
+	var shutdownOnce sync.Once
+	shutdown := func(trigger string) {
+		shutdownOnce.Do(func() {
+			Logf("quit (%s): disconnecting all SSH tunnels", trigger)
+			sshMgr.DisconnectAll()
+			quitProcess()
+		})
+	}
+
 	// Quit handling lives on its own goroutine: a quit request can
 	// arrive while the window is up — runAppLoop is then inside its
 	// window event loop and would not see quitCh until the window is
@@ -137,9 +166,7 @@ func main() {
 	// process for real (see quitProcess).
 	go func() {
 		<-quitCh
-		Log("quit: disconnecting all SSH tunnels")
-		sshMgr.DisconnectAll()
-		quitProcess()
+		shutdown("tray")
 	}()
 
 	// External termination (kill / Ctrl+C in a terminal) must behave
@@ -150,9 +177,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGTERM, os.Interrupt)
 	go func() {
 		sig := <-sigCh
-		Logf("received %v — disconnecting all tunnels and exiting", sig)
-		sshMgr.DisconnectAll()
-		quitProcess()
+		shutdown(fmt.Sprintf("signal %v", sig))
 	}()
 
 	// trayConnect connects the first forward from the tray. If the

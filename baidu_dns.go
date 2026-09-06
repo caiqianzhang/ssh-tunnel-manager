@@ -234,53 +234,65 @@ func NewDnsTarget(accessKey, secretKey, zone, sub, apiBase string) *DnsTarget {
 }
 
 // listRecords calls POST /v1/domain/resolve/list and returns the raw
-// JSON record array from the "result" field.
+// JSON records of the whole zone. Results are paginated (pageSize 100):
+// a zone with more records than one page would otherwise silently hide
+// its later entries — exactly the A record this feature needs.
 func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) {
 	path := "/v1/domain/resolve/list"
-	body := fmt.Sprintf(`{"domain":"%s","pageNo":1,"pageSize":100}`, d.Zone)
+	const pageSize = 100
+	const maxPages = 10 // 1000 records — plenty for a DDNS zone, and a
+	//                    hard stop against a misbehaving API.
 
-	req, err := http.NewRequest("POST", d.APIBase+canonicalURI(path), strings.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create DNS request: %w", err)
-	}
+	var all []json.RawMessage
+	for pageNo := 1; pageNo <= maxPages; pageNo++ {
+		body := fmt.Sprintf(`{"domain":%q,"pageNo":%d,"pageSize":%d}`, d.Zone, pageNo, pageSize)
 
-	now := time.Now().UTC()
-	req.Header.Set("Authorization", signRequest(d.AccessKey, d.SecretKey, "POST", path, now))
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Host", "bcd.baidubce.com")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("请求百度云 DNS %s 失败: %w", path, err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取百度云 DNS %s 响应失败(HTTP %d): %w", path, resp.StatusCode, err)
-	}
-
-	// Some endpoints (e.g. edit) return an empty body on success.
-	if strings.TrimSpace(string(respBody)) == "" {
-		return nil, nil
-	}
-
-	var payload struct {
-		Result []json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(respBody, &payload); err != nil {
-		return nil, fmt.Errorf("百度云 DNS %s 响应解析失败(HTTP %d): %w", path, resp.StatusCode, err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errPayload struct {
-			Message string `json:"message"`
+		req, err := http.NewRequest("POST", d.APIBase+canonicalURI(path), strings.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create DNS request: %w", err)
 		}
-		json.Unmarshal(respBody, &errPayload)
-		return nil, fmt.Errorf("百度云 DNS %s HTTP %d: %s", path, resp.StatusCode, errPayload.Message)
-	}
 
-	return payload.Result, nil
+		now := time.Now().UTC()
+		req.Header.Set("Authorization", signRequest(d.AccessKey, d.SecretKey, "POST", path, now))
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		req.Header.Set("Host", "bcd.baidubce.com")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("请求百度云 DNS %s 失败: %w", path, err)
+		}
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("读取百度云 DNS %s 响应失败(HTTP %d): %w", path, resp.StatusCode, readErr)
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			var errPayload struct {
+				Message string `json:"message"`
+			}
+			json.Unmarshal(respBody, &errPayload)
+			return nil, fmt.Errorf("百度云 DNS %s HTTP %d: %s", path, resp.StatusCode, errPayload.Message)
+		}
+
+		// Some endpoints (e.g. edit) return an empty body on success.
+		if strings.TrimSpace(string(respBody)) == "" {
+			break
+		}
+
+		var payload struct {
+			Result []json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(respBody, &payload); err != nil {
+			return nil, fmt.Errorf("百度云 DNS %s 响应解析失败(HTTP %d): %w", path, resp.StatusCode, err)
+		}
+
+		all = append(all, payload.Result...)
+		if len(payload.Result) < pageSize {
+			break // last page
+		}
+	}
+	return all, nil
 }
 
 // QueryBaiduDNSIP queries the Baidu DNS API for the current A record IP
