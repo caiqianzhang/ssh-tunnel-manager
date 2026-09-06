@@ -56,6 +56,14 @@ func runtimeSocketPath() string {
 	return filepath.Join(os.TempDir(), "ssh-tunnel-manager.sock")
 }
 
+// removeRuntimeSocket deletes the show-request socket file. The
+// listener is never closed during the process lifetime, so this runs
+// once at shutdown (quitProcess); a socket left behind by a crashed
+// instance is removed by listenForShowRequests on the next launch.
+func removeRuntimeSocket() {
+	os.Remove(runtimeSocketPath())
+}
+
 // notifyRunningInstance asks an already-running instance to show its
 // window. Returns true if a running instance was reached.
 func notifyRunningInstance() bool {

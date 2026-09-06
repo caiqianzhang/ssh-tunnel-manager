@@ -54,9 +54,13 @@ func (ui *UI) settingsCardAdvanced(gtx layout.Context) layout.Dimensions {
 	}
 	return ui.drawSection(gtx, "高级选项", func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceBetween}.Layout(gtx,
+			layout.Rigid(ui.settingsField(gtx, "DDNS 探测周期(秒)", &ui.ddnsIntervalEntry)),
+			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(checkbox(&ui.autoReconnect, "自动重连")),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(checkbox(&ui.forwardLocal, "本地转发 (-L)")),
+			layout.Rigid(layout.Spacer{Height: 10}.Layout),
+			layout.Rigid(ui.zoneForwardRow),
 		)
 	})
 }
@@ -211,4 +215,57 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// zoneForwardRow renders the 域名解析优化 feature row. Returns zero
+// size on systems without systemd-resolved so the row disappears
+// entirely.
+//
+// Button prominence follows the state: 启用/更新 (an action the user
+// asked for) gets the prominent filled button; the up-to-date state
+// gets no filled button at all — just a demoted 移除 text link, since
+// removing is a rare troubleshooting action and a big button invited
+// accidental clicks. The pkexec dialog doubles as its confirmation.
+func (ui *UI) zoneForwardRow(gtx layout.Context) layout.Dimensions {
+	if !ui.zoneSupported {
+		return layout.Dimensions{}
+	}
+	status := func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Body2(ui.theme, "域名解析优化："+ui.zoneStatusText)
+		lbl.Color = ColorTextSec
+		lbl.TextSize = unit.Sp(12)
+		return lbl.Layout(gtx)
+	}
+	caption := ui.zoneActionLabel
+	if ui.zoneBusy {
+		caption = "执行中…"
+	}
+
+	// Up to date: status line with a demoted 移除 text link.
+	if ui.zonePending == zoneActionRemove {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, status),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return ui.zoneBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					fg := ColorTextSec
+					if ui.zoneBtn.Hovered() {
+						fg = ColorDanger
+					}
+					lbl := material.Body2(ui.theme, caption)
+					lbl.Color = fg
+					lbl.TextSize = unit.Sp(12)
+					return lbl.Layout(gtx)
+				})
+			}),
+		)
+	}
+
+	// 启用 / 更新: the action the user wants gets the prominent button.
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(status),
+		layout.Rigid(layout.Spacer{Height: 8}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return ui.drawRoundedBtn(gtx, &ui.zoneBtn, caption, ColorBlue, ColorOnAccent)
+		}),
+	)
 }

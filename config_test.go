@@ -353,3 +353,37 @@ func TestConfigLoadsLegacyPlaintextAPIKey(t *testing.T) {
 		t.Errorf("legacy plaintext API key not preserved: got %q want %q", got, apiKey)
 	}
 }
+
+// TestDDNSCheckIntervalRoundTrip verifies the settings.ddns_check_interval
+// field survives Save → Load through the ConfigManager.
+func TestDDNSCheckIntervalRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	cm := NewConfigManager(path)
+	cm.SetDDNSCheckInterval(7)
+	if err := cm.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	cm2 := NewConfigManager(path)
+	if err := cm2.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cm2.GetDDNSCheckInterval(); got != 7 {
+		t.Errorf("expected ddns_check_interval 7 after round trip, got %d", got)
+	}
+
+	// Unset (0) must stay unset — it means "use the built-in default".
+	path2 := filepath.Join(t.TempDir(), "empty.json")
+	cm3 := NewConfigManager(path2)
+	if err := cm3.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	cm4 := NewConfigManager(path2)
+	if err := cm4.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cm4.GetDDNSCheckInterval(); got != 0 {
+		t.Errorf("expected unset ddns_check_interval to stay 0, got %d", got)
+	}
+}

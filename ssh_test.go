@@ -119,7 +119,7 @@ func TestAutoReconnectAbortsOnStopCh(t *testing.T) {
 	// starting any process. We verify by checking no process was started
 	// (conn.Process stays nil) and the connection is still in the map
 	// with its original status.
-	mgr.autoReconnect("abort-test")
+	mgr.autoReconnect("abort-test", false)
 
 	if conn.Process != nil {
 		t.Error("autoReconnect started a process despite closed StopCh")
@@ -231,7 +231,7 @@ func TestBuildSSHCommandPasswordNotInCmdline(t *testing.T) {
 	cmd := buildSSHCommand(ForwardConfig{
 		ForwardType: "local", RemoteHost: "h", RemotePort: 22,
 		LocalHost: "l", LocalPort: 2222, SSHUser: "u", SSHPassword: password,
-	})
+	}, "")
 	if cmd == nil {
 		t.Fatal("expected non-nil command")
 	}
@@ -251,7 +251,7 @@ func TestBuildSSHCommandPasswordNotInCmdline(t *testing.T) {
 	cmd2 := buildSSHCommand(ForwardConfig{
 		ForwardType: "local", RemoteHost: "h", RemotePort: 22,
 		LocalHost: "l", LocalPort: 2222, SSHUser: "u",
-	})
+	}, "")
 	if strings.Contains(strings.Join(cmd2.Args, " "), "sshpass") {
 		t.Errorf("did not expect sshpass for passwordless config, got: %v", cmd2.Args)
 	}
@@ -728,6 +728,8 @@ func TestDDNSHeartbeatKillsProcessOnIPChange(t *testing.T) {
 	}()
 
 	// The heartbeat should detect the IP mismatch and kill the process.
+	// NOTE: done closes as soon as the monitor goroutine is spawned;
+	// the real signal is the process death waited on below.
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -745,4 +747,196 @@ func TestDDNSHeartbeatKillsProcessOnIPChange(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Error("process was not killed by DDNS heartbeat")
 	}
+
+	// The kill must be marked as DDNS-triggered so the subsequent
+	// autoReconnect skips the retry sleep (the server is confirmed
+	// alive at its new IP — waiting would only prolong the blackout).
+	// The flag is set before the kill, so it is observable once the
+	// process death has been reaped.
+	mgr.mu.RLock()
+	marked := conn.DDNSRestart
+	mgr.mu.RUnlock()
+	if !marked {
+		t.Error("expected DDNSRestart flag to be set before killing the process")
+	}
+}
+
+// ---------- resolveConnectTarget (startup DDNS fast-path) ----------
+
+// TestBuildSSHCommandUsesResolvedHost pins the connect-target contract:
+// the host argument — normally the IP from resolveConnectTarget — must
+// reach the ssh command line. Previously the parameter was silently
+// dropped and ssh always re-resolved cfg.RemoteHost through the local
+// resolver, which can be up to one record TTL stale in the DDNS
+// scenario and defeats the Baidu DNS fast-path entirely.
+func TestBuildSSHCommandUsesResolvedHost(t *testing.T) {
+	cfg := ForwardConfig{
+		ForwardType: "local", RemoteHost: "www.example.com", RemotePort: 22,
+		LocalHost: "l", LocalPort: 2222, SSHUser: "u",
+	}
+
+	cmd := buildSSHCommand(cfg, "10.99.88.77")
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "-l u 10.99.88.77") {
+		t.Errorf("expected ssh to connect to the resolved IP, got: %s", joined)
+	}
+	if strings.Contains(joined, "www.example.com") {
+		t.Errorf("stale hostname leaked into the ssh command: %s", joined)
+	}
+
+	// Empty host falls back to the configured hostname.
+	cmd2 := buildSSHCommand(cfg, "")
+	if !strings.Contains(strings.Join(cmd2.Args, " "), "-l u www.example.com") {
+		t.Errorf("expected fallback to RemoteHost, got: %v", cmd2.Args)
+	}
+}
+
+// TestResolveConnectTargetFallsBackWithoutCreds verifies the fallback
+// path: with no Baidu credentials the configured hostname is kept and
+// resolved through ordinary DNS.
+func TestResolveConnectTargetFallsBackWithoutCreds(t *testing.T) {
+	clearBaiduCredsForTest(t)
+
+	host, ip, err := resolveConnectTarget("localhost")
+	if err != nil {
+		t.Fatalf("resolveConnectTarget failed: %v", err)
+	}
+	if host != "localhost" {
+		t.Errorf("expected host to stay 'localhost', got %q", host)
+	}
+	if ip == "" {
+		t.Error("expected a resolved IP for localhost")
+	}
+}
+
+// TestResolveConnectTargetUsesBaiduAPI verifies that with credentials
+// configured the authoritative API answer wins over local DNS: the
+// returned connect host IS the API's IP, so the tunnel never depends on
+// the (possibly stale) local resolver cache.
+func TestResolveConnectTargetUsesBaiduAPI(t *testing.T) {
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 1, "domain": "@", "rdtype": "A",
+					"rdata": "10.99.88.77", "zoneName": "localhost", "status": "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	origBase := baiduDNSAPIBase
+	baiduDNSAPIBase = server.URL
+	t.Cleanup(func() { baiduDNSAPIBase = origBase })
+
+	setBaiduCredsForTest(t, "AK-test", "SK-test")
+	defer clearBaiduCredsForTest(t)
+
+	host, ip, err := resolveConnectTarget("localhost")
+	if err != nil {
+		t.Fatalf("resolveConnectTarget failed: %v", err)
+	}
+	if !hit {
+		t.Error("expected mock Baidu API to be called")
+	}
+	if host != "10.99.88.77" || ip != "10.99.88.77" {
+		t.Errorf("expected Baidu IP 10.99.88.77 as connect target, got host=%q ip=%q", host, ip)
+	}
+}
+
+// TestResolveConnectTargetSkipsIPLiteral verifies that an already-IP
+// remote host never triggers a pointless API round trip.
+func TestResolveConnectTargetSkipsIPLiteral(t *testing.T) {
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": []interface{}{}})
+	}))
+	defer server.Close()
+
+	origBase := baiduDNSAPIBase
+	baiduDNSAPIBase = server.URL
+	t.Cleanup(func() { baiduDNSAPIBase = origBase })
+
+	setBaiduCredsForTest(t, "AK-test", "SK-test")
+	defer clearBaiduCredsForTest(t)
+
+	host, ip, err := resolveConnectTarget("127.0.0.1")
+	if err != nil {
+		t.Fatalf("resolveConnectTarget failed: %v", err)
+	}
+	if hit {
+		t.Error("expected Baidu API to be skipped for an IP-literal host")
+	}
+	if host != "127.0.0.1" || ip != "127.0.0.1" {
+		t.Errorf("expected 127.0.0.1 untouched, got host=%q ip=%q", host, ip)
+	}
+}
+
+// TestAutoReconnectSkipsSleepOnDDNSTrigger pins the fast-restart
+// contract: the first attempt of a DDNS-triggered reconnect must not
+// pay the retry_interval sleep (the Baidu API just confirmed the server
+// is alive at its new IP), while a plain reconnect keeps waiting —
+// whatever failed may need time to heal.
+func TestAutoReconnectSkipsSleepOnDDNSTrigger(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: requires the 'true' binary")
+	}
+	clearBaiduCredsForTest(t)
+
+	mgr := NewSSHManager()
+	mgr.commandBuilder = func(cfg ForwardConfig, host string) *exec.Cmd {
+		// `true` starts fine and exits immediately — no network, no
+		// tunnel; we only measure how long autoReconnect takes to
+		// reach the start.
+		return exec.Command("true")
+	}
+
+	newConn := func(id string) *SSHConn {
+		return &SSHConn{
+			Config: ForwardConfig{
+				ID: id, RemoteHost: "127.0.0.1", RemotePort: 22,
+				LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+				// Keep handleProcessExit from re-spawning a reconnect
+				// when `true` exits right after the start.
+				AutoReconnect: false,
+				MaxRetries:    1, RetryInterval: 2,
+			},
+			Status: "disconnected",
+			StopCh: make(chan struct{}),
+		}
+	}
+
+	mgr.mu.Lock()
+	mgr.conns["ddns-fast"] = newConn("ddns-fast")
+	mgr.mu.Unlock()
+
+	start := time.Now()
+	mgr.autoReconnect("ddns-fast", true)
+	ddnsElapsed := time.Since(start)
+	_ = mgr.Disconnect("ddns-fast")
+
+	// Plain reconnect, measured second so a slow machine can't mask
+	// the difference in ddnsElapsed's favor.
+	mgr.mu.Lock()
+	mgr.conns["plain"] = newConn("plain")
+	mgr.mu.Unlock()
+
+	start = time.Now()
+	mgr.autoReconnect("plain", false)
+	plainElapsed := time.Since(start)
+	_ = mgr.Disconnect("plain")
+
+	if ddnsElapsed >= 2*time.Second {
+		t.Errorf("DDNS-triggered reconnect paid the retry sleep: %v", ddnsElapsed)
+	}
+	if plainElapsed < 2*time.Second {
+		t.Errorf("plain reconnect did not wait out the retry sleep: %v", plainElapsed)
+	}
+	t.Logf("ddns-triggered=%v plain=%v", ddnsElapsed, plainElapsed)
 }

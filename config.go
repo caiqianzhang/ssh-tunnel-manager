@@ -28,6 +28,12 @@ type ForwardConfig struct {
 	RetryInterval int    `json:"retry_interval"`
 }
 
+// DefaultDDNSIntervalSeconds is the heartbeat period between Baidu DNS
+// IP checks while a tunnel is running. 15s keeps detection well under
+// the record TTL (usually 60s) without hammering the API; it can be
+// overridden per config (settings.ddns_check_interval, seconds).
+const DefaultDDNSIntervalSeconds = 15
+
 // AppState represents the entire application configuration state
 type AppState struct {
 	Forwards []ForwardConfig `json:"forwards"`
@@ -37,6 +43,9 @@ type AppState struct {
 // AppSettings holds application-level settings
 type AppSettings struct {
 	APIKey string `json:"api_key,omitempty"`
+	// DDNSCheckInterval is the DDNS heartbeat period in seconds.
+	// 0 (unset) means "use DefaultDDNSIntervalSeconds".
+	DDNSCheckInterval int `json:"ddns_check_interval,omitempty"`
 }
 
 // ConfigManager manages configuration persistence and operations
@@ -261,4 +270,21 @@ func (cm *ConfigManager) SetAPIKey(key string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.state.Settings.APIKey = key
+}
+
+// GetDDNSCheckInterval returns the configured DDNS heartbeat period in
+// seconds. 0 means unset — callers should fall back to
+// DefaultDDNSIntervalSeconds.
+func (cm *ConfigManager) GetDDNSCheckInterval() int {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.state.Settings.DDNSCheckInterval
+}
+
+// SetDDNSCheckInterval stores the DDNS heartbeat period in seconds.
+// Values <= 0 mean "use the default".
+func (cm *ConfigManager) SetDDNSCheckInterval(seconds int) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state.Settings.DDNSCheckInterval = seconds
 }

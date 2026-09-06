@@ -11,6 +11,16 @@ lets you connect, disconnect and restore the window.
 
 - Local (`-L`) and remote (`-R`) port forwarding over a plain `ssh`
   process, so existing known_hosts/agent settings keep working
+- DDNS fast-path on connect: with `baidu.key` present the server IP is
+  pulled from the Baidu Cloud DNS API (authoritative, bypasses stale
+  local resolver caches), the OS DNS cache is flushed afterwards, and a
+  heartbeat (default 15s, tunable via `settings.ddns_check_interval`)
+  restarts the tunnel when the IP changes while it is up
+- Optional 域名解析优化 (Linux/desktop): one click in the settings page
+  installs a systemd-resolved drop-in (through a pkexec password
+  prompt) routing the forwarded domain straight to its authoritative
+  nameservers, so local tools like ping/curl resolve fresh addresses
+  instead of ISP-cached stale ones
 - Status card with live tunnel state and forwarding address
 - Port-conflict dialog (kill process / change port / ignore)
 - Connection settings collapsed into the main page; config stored as
@@ -54,4 +64,5 @@ edit the values before connecting.
 | `ssh.go` | tunnel process management, status transitions, reconnect |
 | `config.go` / `crypto.go` / `logger.go` / `paths.go` | config persistence, password encryption, logging, file locations |
 | `tray.go` | tray icon/menu (fyne.io/systray) |
+| `cmd/querydns` | standalone CLI: dump Baidu Cloud DNS records for a zone (reads `baidu.key`) |
 | `third_party/gio` | vendored Gio with local patches — see `PATCHES.md` |

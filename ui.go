@@ -57,15 +57,16 @@ type UI struct {
 	lastShownStatus string
 
 	// Settings form
-	remoteHostEntry  widget.Editor
-	remotePortEntry  widget.Editor
-	localHostEntry   widget.Editor
-	localPortEntry   widget.Editor
-	sshUserEntry     widget.Editor
-	sshPasswordEntry widget.Editor
-	apiKeyEntry      widget.Editor
-	autoReconnect    widget.Bool
-	forwardLocal     widget.Bool
+	remoteHostEntry   widget.Editor
+	remotePortEntry   widget.Editor
+	localHostEntry    widget.Editor
+	localPortEntry    widget.Editor
+	sshUserEntry      widget.Editor
+	sshPasswordEntry  widget.Editor
+	apiKeyEntry       widget.Editor
+	ddnsIntervalEntry widget.Editor
+	autoReconnect     widget.Bool
+	forwardLocal      widget.Bool
 
 	// Settings scroll
 	settingsList   widget.List
@@ -73,6 +74,17 @@ type UI struct {
 
 	// Settings buttons
 	saveBtn widget.Clickable
+
+	// Zone-forwarding (域名解析优化) feature. refreshZoneForwardStatusAsync
+	// computes the row's content off the UI thread and applies it via
+	// queueUIFunc, so these fields are only mutated on the UI thread;
+	// zoneBusy guards double clicks while the pkexec dialog is open.
+	zoneBtn         widget.Clickable
+	zoneBusy        bool
+	zoneSupported   bool
+	zoneActionLabel string // button caption: 启用 / 更新 / 移除
+	zonePending     string // action to run when the button is clicked
+	zoneStatusText  string // one-line status shown above the button
 
 	// Animation
 	animTick int
@@ -169,6 +181,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.sshPasswordEntry.SingleLine = true
 	u.apiKeyEntry.SingleLine = true
 	u.apiKeyEntry.Mask = '•' // Mask the API key for security
+	u.ddnsIntervalEntry.SingleLine = true
 
 	u.forwardLocal.Value = true
 	u.autoReconnect.Value = true
@@ -198,6 +211,14 @@ func (ui *UI) loadConfigToForm() {
 
 	// Load API key from config
 	ui.apiKeyEntry.SetText(ui.config.GetAPIKey())
+
+	// DDNS probe interval: show the effective value (the built-in
+	// default when the config leaves it unset).
+	interval := ui.config.GetDDNSCheckInterval()
+	if interval <= 0 {
+		interval = DefaultDDNSIntervalSeconds
+	}
+	ui.ddnsIntervalEntry.SetText(strconv.Itoa(interval))
 }
 
 func (ui *UI) Layout(gtx layout.Context) layout.Dimensions {
@@ -303,6 +324,11 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	}
 	if _, ok := ui.saveBtn.Update(gtx); ok {
 		ui.saveSettings()
+	}
+
+	// Zone-forwarding feature button (域名解析优化).
+	if _, ok := ui.zoneBtn.Update(gtx); ok {
+		ui.startZoneForwardAction()
 	}
 
 	// Handle port conflict dialog buttons. Bug 22: ignore repeat clicks
@@ -691,6 +717,20 @@ func (ui *UI) saveSettings() {
 	// Save API key
 	ui.config.SetAPIKey(strings.TrimSpace(ui.apiKeyEntry.Text()))
 
+	// Save the DDNS probe interval. Empty or invalid input keeps the
+	// default (0 = unset); negative values are clamped.
+	ddnsInterval, _ := strconv.Atoi(strings.TrimSpace(ui.ddnsIntervalEntry.Text()))
+	if ddnsInterval < 0 {
+		ddnsInterval = 0
+	}
+	ui.config.SetDDNSCheckInterval(ddnsInterval)
+	// Live-apply to the manager: tunnels started or reconnected from
+	// now on use the new period (a heartbeat already ticking finishes
+	// its current cycle first).
+	if ddnsInterval > 0 {
+		ui.ssh.ddnsCheckInterval = time.Duration(ddnsInterval) * time.Second
+	}
+
 	// Bug 5: report save failure to the user and keep them on the
 	// settings page so they can retry. Success transitions to main.
 	if err := ui.config.Save(); err != nil {
@@ -702,6 +742,9 @@ func (ui *UI) saveSettings() {
 	Log("UI.saveSettings: config saved successfully")
 	ui.setTestResult("✓ 设置已保存", true)
 	ui.settingsExpanded = false
+	// The forward's domain may have changed — recompute the
+	// 域名解析优化 row against the new zone.
+	ui.refreshZoneForwardStatusAsync()
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -714,4 +757,105 @@ func getFirstForwardID(cfg *ConfigManager) string {
 		return forwards[0].ID
 	}
 	return ""
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ZONE FORWARDING (域名解析优化)
+// ═══════════════════════════════════════════════════════════════
+
+// refreshZoneForwardStatusAsync recomputes the zone-forwarding row off
+// the UI thread: a file compare for the install state, plus NS/IP
+// lookups for the current forward's domain. Results land on the UI
+// thread via queueUIFunc. No-op on unsupported systems.
+func (ui *UI) refreshZoneForwardStatusAsync() {
+	forwards := ui.config.GetForwards()
+	go func() {
+		if !zoneForwardSupported() {
+			return
+		}
+		var zone string
+		if len(forwards) > 0 {
+			host := forwards[0].RemoteHost
+			if host != "" && net.ParseIP(host) == nil {
+				zone, _ = deriveZoneAndSub(host)
+			}
+		}
+		var text, action, pending string
+		switch {
+		case zone == "" || !strings.Contains(zone, "."):
+			text = "未配置域名"
+		default:
+			expected, err := expectedZoneForwardContent(zone)
+			if err != nil {
+				// Details for the log; the UI row only has room for a
+				// short label (the window is 280px wide).
+				Logf("zone forward: %s: %v", zone, err)
+				text = "查询失败"
+				break
+			}
+			installed, upToDate := zoneForwardStatus(expected)
+			switch {
+			case !installed:
+				text = "未启用"
+				action, pending = "启用", zoneActionInstall
+			case !upToDate:
+				text = "有更新"
+				action, pending = "更新", zoneActionInstall
+			default:
+				text = "已启用"
+				action, pending = "移除", zoneActionRemove
+			}
+		}
+		ui.queueUIFunc(func() {
+			ui.zoneSupported = true
+			ui.zoneStatusText = text
+			ui.zoneActionLabel = action
+			ui.zonePending = pending
+		})
+	}()
+}
+
+// startZoneForwardAction launches the pending zone action (install,
+// update or remove) in the background. Runs on the UI thread; the heavy
+// work (DNS lookups + the pkexec authentication dialog) happens in a
+// goroutine whose result is applied via queueUIFunc.
+func (ui *UI) startZoneForwardAction() {
+	if ui.zoneBusy || ui.zonePending == "" {
+		return
+	}
+	ui.zoneBusy = true
+	action := ui.zonePending
+	go func() {
+		err := func() error {
+			forwards := ui.config.GetForwards()
+			if len(forwards) == 0 {
+				return fmt.Errorf("未配置转发规则")
+			}
+			host := forwards[0].RemoteHost
+			if host == "" || net.ParseIP(host) != nil {
+				return fmt.Errorf("远端地址无需解析优化")
+			}
+			zone, _ := deriveZoneAndSub(host)
+			if !strings.Contains(zone, ".") {
+				return fmt.Errorf("%q 不是可优化的域名", host)
+			}
+			if action == zoneActionRemove {
+				return removeZoneForward()
+			}
+			content, err := expectedZoneForwardContent(zone)
+			if err != nil {
+				return err
+			}
+			return applyZoneForward(content)
+		}()
+		ui.queueUIFunc(func() {
+			ui.zoneBusy = false
+			if err != nil {
+				ui.setTestResult("✗ 域名解析优化："+err.Error(), false)
+			} else {
+				ui.setTestResult("✓ 域名解析优化设置已更新", true)
+			}
+			ui.refreshZoneForwardStatusAsync()
+		})
+	}()
 }

@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Baidu Cloud DNS (BCD) API integration.
@@ -53,10 +55,10 @@ const signExpiration = "1800"
 
 // Cached Baidu credentials, loaded once at startup.
 var (
-	baiduAK  string
-	baiduSK  string
-	baiduMu  sync.RWMutex
-	baiduOK  bool
+	baiduAK string
+	baiduSK string
+	baiduMu sync.RWMutex
+	baiduOK bool
 )
 
 // InitBaiduDNS loads Baidu DNS credentials from baidu.key.
@@ -134,11 +136,12 @@ func LoadBaiduCredentials(path string) (ak, sk string, err error) {
 		if line == "" {
 			continue
 		}
-		// Handle both Chinese "：" (U+FF1A) and ASCII ":".
+		// Handle both Chinese "：" (U+FF1A, 3 bytes in UTF-8) and ASCII ":".
 		var key, value string
 		if idx := strings.Index(line, "："); idx >= 0 {
 			key = strings.TrimSpace(line[:idx])
-			value = strings.TrimSpace(line[idx+2:]) // 2 bytes for UTF-8 Chinese colon
+			_, size := utf8.DecodeRuneInString(line[idx:])
+			value = strings.TrimSpace(line[idx+size:])
 		} else if idx := strings.Index(line, ":"); idx >= 0 {
 			key = strings.TrimSpace(line[:idx])
 			value = strings.TrimSpace(line[idx+1:])
@@ -315,14 +318,37 @@ func QueryBaiduDNSIPWithBase(accessKey, secretKey, zone, sub, apiBase string) (s
 		if err := json.Unmarshal(record, &r); err != nil {
 			continue
 		}
-		// Match the subdomain (e.g. "www") and A record type.
+		// Match the subdomain (e.g. "www") and A/AAAA record type.
 		// The API returns the host name in "domain" (not the full FQDN).
-		if r.Domain == sub && r.RDType == "A" && r.Status == "RUNNING" {
+		if r.Domain == sub && r.Status == "RUNNING" && (r.RDType == "A" || r.RDType == "AAAA") {
 			return r.RData, nil
 		}
 	}
 
 	return "", fmt.Errorf("未找到 %s.%s 的 A 记录", sub, zone)
+}
+
+// ResolveRealIP returns the authoritative current A/AAAA record IP for
+// host via the Baidu DNS API. ok is false when the integration is
+// disabled (no baidu.key), host is already an IP literal, or the zone
+// has no matching record — callers should fall back to ordinary DNS in
+// all of those cases.
+func ResolveRealIP(host string) (ip string, ok bool) {
+	ak, sk, loaded := baiduCredentials()
+	if !loaded || ak == "" || sk == "" {
+		return "", false
+	}
+	// Already an IP literal: nothing to resolve, skip the API round trip.
+	if net.ParseIP(host) != nil {
+		return "", false
+	}
+	zone, sub := deriveZoneAndSub(host)
+	ip, err := QueryBaiduDNSIP(ak, sk, zone, sub)
+	if err != nil {
+		Logf("ResolveRealIP: Baidu DNS query failed for %s: %v", host, err)
+		return "", false
+	}
+	return ip, true
 }
 
 // deriveZoneAndSub splits a hostname into zone (registered domain) and

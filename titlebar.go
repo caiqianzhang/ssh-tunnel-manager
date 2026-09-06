@@ -23,10 +23,10 @@ const titleBarHeight = 32
 // dragTag identifies the title bar drag area for ActionMove input ops.
 var dragTag = new(int)
 
-// layoutTitleBar draws the custom window decorations: the app title on
-// the left (it doubles as the drag handle) and the window control
-// buttons top-right. The platform title bar is disabled via
-// app.Decorated(false).
+// layoutTitleBar draws the custom window decorations: the app title
+// centered in the bar (the whole bar doubles as the drag handle) and
+// the window control buttons top-right. The platform title bar is
+// disabled via app.Decorated(false).
 func (ui *UI) layoutTitleBar(gtx layout.Context) layout.Dimensions {
 	h := gtx.Dp(titleBarHeight)
 	gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
@@ -38,8 +38,8 @@ func (ui *UI) layoutTitleBar(gtx layout.Context) layout.Dimensions {
 	return layout.Inset{Left: 10, Right: 6}.Layout(gtx,
 		func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-				// Title doubles as a drag handle: ActionMove makes
-				// the platform move the window on press-drag.
+				// Title cell doubles as a drag handle: ActionMove
+				// makes the platform move the window on press-drag.
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 					defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
 					// The ActionMove op must attach to its own
@@ -55,7 +55,9 @@ func (ui *UI) layoutTitleBar(gtx layout.Context) layout.Dimensions {
 					lbl := material.Caption(ui.theme, "SSH 隧道管理器")
 					lbl.Color = ColorTextSec
 					lbl.Font.Weight = font.Normal
-					return layout.Inset{Top: 2}.Layout(gtx, lbl.Layout)
+					// Centered in the bar on both axes, matching the
+					// look of native title bars.
+					return layout.Center.Layout(gtx, lbl.Layout)
 				}),
 				layout.Rigid(ui.titleBarBtn(&ui.minBtn, "–", false)),
 				layout.Rigid(layout.Spacer{Width: 4}.Layout),

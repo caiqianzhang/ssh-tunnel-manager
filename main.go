@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/io/system"
@@ -91,6 +94,14 @@ func main() {
 	}
 	sshMgr := NewSSHManager()
 
+	// The DDNS heartbeat period can be tuned from the config file
+	// (settings.ddns_check_interval, seconds); 0/unset keeps the
+	// built-in default of 15s.
+	if s := cfg.GetDDNSCheckInterval(); s > 0 {
+		sshMgr.ddnsCheckInterval = time.Duration(s) * time.Second
+		Logf("DDNS probe interval set to %ds from config", s)
+	}
+
 	// Repaint immediately on tunnel status transitions instead of
 	// waiting for the next interaction-driven frame.
 	sshMgr.SetOnStatusChange(func(forwardID, status string) {
@@ -116,6 +127,32 @@ func main() {
 				showReq <- struct{}{}
 			}
 		}
+	}()
+
+	// Quit handling lives on its own goroutine: a quit request can
+	// arrive while the window is up — runAppLoop is then inside its
+	// window event loop and would not see quitCh until the window is
+	// closed — or in tray mode with no window at all. Either way the
+	// response is the same: disconnect everything, then exit the
+	// process for real (see quitProcess).
+	go func() {
+		<-quitCh
+		Log("quit: disconnecting all SSH tunnels")
+		sshMgr.DisconnectAll()
+		quitProcess()
+	}()
+
+	// External termination (kill / Ctrl+C in a terminal) must behave
+	// like a tray quit. Without this, a killed process orphaned its
+	// ssh children, which kept holding the local forward port and
+	// tripped the port-conflict dialog on the next launch.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, os.Interrupt)
+	go func() {
+		sig := <-sigCh
+		Logf("received %v — disconnecting all tunnels and exiting", sig)
+		sshMgr.DisconnectAll()
+		quitProcess()
 	}()
 
 	// trayConnect connects the first forward from the tray. If the
@@ -163,13 +200,14 @@ func main() {
 		Disconnect: func() { sshMgr.DisconnectAll() },
 	})
 
-	// Start the app event loop (blocks until quit)
-	go runAppLoop(showReq, quitCh, cfg, sshMgr)
+	// Start the app event loop. It runs until the process is torn down
+	// by quitProcess — app.Main() below blocks forever by design.
+	go runAppLoop(showReq, cfg, sshMgr)
 
 	app.Main()
 }
 
-func runAppLoop(showReq, quitCh chan struct{}, cfg *ConfigManager, sshMgr *SSHManager) {
+func runAppLoop(showReq chan struct{}, cfg *ConfigManager, sshMgr *SSHManager) {
 	Log("runAppLoop: starting")
 
 	var ui *UI
@@ -187,6 +225,9 @@ func runAppLoop(showReq, quitCh chan struct{}, cfg *ConfigManager, sshMgr *SSHMa
 			if ui == nil {
 				Log("runAppLoop: creating UI for the first time")
 				ui = NewUI(cfg, sshMgr)
+				// Compute the 域名解析优化 row (DNS lookups) off the
+				// UI thread once the config is loaded.
+				ui.refreshZoneForwardStatusAsync()
 				setAppUI(ui)
 				// Auto-connect on first launch
 				go autoConnect(cfg, sshMgr, ui)
@@ -228,17 +269,38 @@ func runAppLoop(showReq, quitCh chan struct{}, cfg *ConfigManager, sshMgr *SSHMa
 			needWindow = false
 		}
 
-		// Window is gone: wait for show or quit signal.
+		// Window is gone: wait for a show signal. Quitting is handled
+		// by the dedicated quit goroutine in main and exits the whole
+		// process, so it never reaches this loop.
 		select {
 		case <-showReq:
 			Log("runAppLoop: restoring window from tray")
 			needWindow = true
-		case <-quitCh:
-			Log("runAppLoop: quitting, disconnecting all SSH tunnels")
-			sshMgr.DisconnectAll()
-			return
 		}
 	}
+}
+
+// quitProcess performs the final teardown and exits the process.
+//
+// app.Main() blocks forever on desktop platforms by design (see
+// third_party/gio/app/app.go), so there is no graceful return path
+// through main(): without an explicit exit the process lingers after a
+// tray quit — tunnels disconnected and tray icon gone, but still
+// holding the single-instance lock and the show-request socket, still
+// showing up in the taskbar, and quietly eating relaunch attempts (a
+// new process wakes the zombie instead of starting).
+func quitProcess() {
+	// Give the tray implementation a moment to unregister the icon —
+	// systray.Quit has been called by the time we get here, and exiting
+	// immediately can leave a ghost icon behind until the next hover.
+	time.Sleep(150 * time.Millisecond)
+	// The show-request listener is never closed during the process
+	// lifetime; remove its socket so nothing references a dead process.
+	// The flock-based lock file needs no cleanup: the OS releases it
+	// when we exit.
+	removeRuntimeSocket()
+	CloseLogger()
+	os.Exit(0)
 }
 
 func autoConnect(cfg *ConfigManager, sshMgr *SSHManager, ui *UI) {

@@ -19,3 +19,7 @@ func notifyRunningInstance() bool {
 // listenForShowRequests has no Unix-socket counterpart on Windows.
 func listenForShowRequests(showCh chan struct{}) {
 }
+
+// removeRuntimeSocket has no Unix-socket counterpart on Windows.
+func removeRuntimeSocket() {
+}

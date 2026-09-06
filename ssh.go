@@ -21,8 +21,15 @@ type SSHConn struct {
 	Status    string
 	CurrentIP string
 	Stderr    bytes.Buffer
-	mu        sync.Mutex
-	StopCh    chan struct{}
+	// DDNSRestart is set by the DDNS heartbeat right before it kills
+	// the process because the server IP changed. handleProcessExit
+	// consumes the flag (and resets it) so autoReconnect can skip the
+	// retry sleep: the API just confirmed the server is up at its new
+	// IP, so waiting would only prolong the blackout. Guarded by the
+	// manager's mu.
+	DDNSRestart bool
+	mu          sync.Mutex
+	StopCh      chan struct{}
 }
 
 // SSHManager manages multiple SSH connections
@@ -40,7 +47,8 @@ type SSHManager struct {
 	commandBuilder func(ForwardConfig, string) *exec.Cmd
 
 	// ddnsCheckInterval is the period between Baidu DNS IP checks in
-	// startDDNSMonitor. Defaults to 30s; tests override it to tick fast.
+	// startDDNSMonitor. Defaults to DefaultDDNSIntervalSeconds (15s);
+	// the config file and tests can override it.
 	ddnsCheckInterval time.Duration
 }
 
@@ -49,9 +57,9 @@ func NewSSHManager() *SSHManager {
 	return &SSHManager{
 		conns: make(map[string]*SSHConn),
 		commandBuilder: func(cfg ForwardConfig, host string) *exec.Cmd {
-			return buildSSHCommand(cfg)
+			return buildSSHCommand(cfg, host)
 		},
-		ddnsCheckInterval: 30 * time.Second,
+		ddnsCheckInterval: time.Duration(DefaultDDNSIntervalSeconds) * time.Second,
 	}
 }
 
@@ -62,7 +70,7 @@ func (m *SSHManager) buildCmd(cfg ForwardConfig, host string) *exec.Cmd {
 	if m.commandBuilder != nil {
 		return m.commandBuilder(cfg, host)
 	}
-	return buildSSHCommand(cfg)
+	return buildSSHCommand(cfg, host)
 }
 
 // SetOnStatusChange registers a callback fired on every status
@@ -107,11 +115,18 @@ func FlushDNS() error {
 		}
 		return nil
 	case "linux":
-		// Try systemd-resolve first. A 5s timeout prevents sudo from
-		// hanging if it prompts for a password in a non-interactive
-		// context (e.g. inside a test runner or a headless service).
+		// Total 5s budget: none of these may hang the caller when they
+		// prompt for a password or are missing (e.g. inside a test
+		// runner or a headless service).
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// resolvectl first, without sudo: systemd ships a polkit rule
+		// that lets active desktop sessions flush the cache, while the
+		// sudo variants below always fail in a GUI app (no tty for the
+		// password prompt).
+		if err := exec.CommandContext(ctx, "resolvectl", "flush-caches").Run(); err == nil {
+			return nil
+		}
 		if err := exec.CommandContext(ctx, "sudo", "systemd-resolve", "--flush-caches").Run(); err == nil {
 			return nil
 		}
@@ -299,8 +314,11 @@ func extractPIDFromSS(output string) string {
 	return ""
 }
 
-// buildSSHCommand creates an exec.Cmd for an SSH tunnel with the given config.
-// Handles both password (via sshpass) and key-based authentication.
+// sshArgs returns the ssh argument list for a tunnel. host is the
+// address ssh connects to — normally the IP resolved by
+// resolveConnectTarget — and falls back to cfg.RemoteHost when empty.
+// Shared by buildSSHCommand (which wraps it in sshpass when a password
+// is configured) and FormatSSHCommand (which renders it for display).
 //
 // Forward semantics:
 //   - local  (-L): SSH server-side destination. Default 127.0.0.1 means
@@ -309,7 +327,11 @@ func extractPIDFromSS(output string) string {
 //     a service running on the SSH client machine — typically the user's
 //     laptop. We use cfg.LocalHost so the configured value reaches the
 //     SSH server (default: localhost/127.0.0.1 on the client).
-func buildSSHCommand(cfg ForwardConfig) *exec.Cmd {
+func sshArgs(cfg ForwardConfig, host string) []string {
+	if host == "" {
+		host = cfg.RemoteHost
+	}
+
 	forwardFlag := "-L"
 	if cfg.ForwardType == "remote" {
 		forwardFlag = "-R"
@@ -344,7 +366,17 @@ func buildSSHCommand(cfg ForwardConfig) *exec.Cmd {
 		args = append(args, "-o", "PubkeyAuthentication=no")
 	}
 
-	args = append(args, "-l", cfg.SSHUser, cfg.RemoteHost)
+	args = append(args, "-l", cfg.SSHUser, host)
+	return args
+}
+
+// buildSSHCommand creates the exec.Cmd for an SSH tunnel. host is the
+// connect target resolved by resolveConnectTarget (usually an IP);
+// passing the IP instead of the hostname is what makes the DDNS
+// fast-path work — ssh re-resolving the hostname itself would use the
+// local resolver cache, which can be up to one record TTL stale.
+func buildSSHCommand(cfg ForwardConfig, host string) *exec.Cmd {
+	args := sshArgs(cfg, host)
 
 	if cfg.SSHPassword != "" {
 		// Never pass the password on the command line: every local
@@ -382,12 +414,43 @@ func attachPasswordPipe(cmd *exec.Cmd, password string) (*os.File, error) {
 	return r, nil
 }
 
+// resolveConnectTarget decides what the SSH process should actually
+// connect to. When Baidu Cloud DNS credentials are configured and the
+// host is a Baidu-managed zone, the authoritative record is fetched
+// straight from the API: the local resolver may hold a stale record
+// for up to one record TTL (DDNS records often use TTL 60), which
+// routes a fresh tunnel to a dead or wrong server right after an IP
+// change. On a successful API lookup the OS DNS cache is flushed
+// (best effort) so other consumers resolve fresh again. Everything
+// else — integration disabled, IP-literal host, API error, unknown
+// zone — falls back to ordinary DNS resolution.
+//
+// Returns (connectHost, resolvedIP, error).
+func resolveConnectTarget(remoteHost string) (host, ip string, err error) {
+	if realIP, ok := ResolveRealIP(remoteHost); ok {
+		if ferr := FlushDNS(); ferr != nil {
+			Logf("resolveConnectTarget: DNS cache flush failed (non-fatal): %v", ferr)
+		}
+		return realIP, realIP, nil
+	}
+
+	ips, rerr := ResolveHost(remoteHost)
+	if rerr != nil {
+		return "", "", rerr
+	}
+	if len(ips) == 0 {
+		return "", "", fmt.Errorf("no IPs found for host %s", remoteHost)
+	}
+	return remoteHost, ips[0], nil
+}
+
 // Connect starts an SSH tunnel with the given configuration.
 //
-// DNS resolution happens outside the manager lock so a slow resolver
-// cannot block other connections or status queries. The connection is
-// reported as "connecting" immediately; monitorProcess transitions it
-// to "running" once the SSH handshake has had time to complete.
+// Connect-target resolution happens outside the manager lock so a slow
+// resolver (or the Baidu DNS API round trip) cannot block other
+// connections or status queries. The connection is reported as
+// "connecting" immediately; monitorProcess transitions it to "running"
+// once the SSH handshake has had time to complete.
 func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	// Check if already connected (short critical section).
 	m.mu.Lock()
@@ -397,17 +460,15 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	}
 	m.mu.Unlock()
 
-	// Resolve host outside the lock.
-	ips, err := ResolveHost(cfg.RemoteHost)
+	// Resolve the connect target outside the lock: Baidu DNS API first
+	// (authoritative, bypasses a stale local cache), local DNS as
+	// fallback.
+	hostToUse, ip, err := resolveConnectTarget(cfg.RemoteHost)
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %v", err)
 	}
 
-	if len(ips) == 0 {
-		return fmt.Errorf("no IPs found for host %s", cfg.RemoteHost)
-	}
-
-	cmd := m.buildCmd(cfg, cfg.RemoteHost)
+	cmd := m.buildCmd(cfg, hostToUse)
 
 	// If the config carries a password, feed it to sshpass through a
 	// pipe (fd 3) rather than the command line.
@@ -425,7 +486,7 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 		Config:    cfg,
 		Process:   cmd,
 		Status:    "connecting",
-		CurrentIP: ips[0],
+		CurrentIP: ip,
 		StopCh:    make(chan struct{}),
 	}
 
@@ -463,7 +524,7 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	m.notifyStatus(cfg.ID, "connecting")
 
 	Logf("SSH tunnel started: %s (%s) -> %s:%d via %s (IP: %s)",
-		cfg.Name, cfg.ForwardType, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ips[0])
+		cfg.Name, cfg.ForwardType, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ip)
 
 	// Start monitoring goroutine
 	go m.monitorProcess(cfg.ID)
@@ -568,7 +629,7 @@ func (m *SSHManager) monitorProcess(id string) {
 func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost string) {
 	interval := m.ddnsCheckInterval
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = time.Duration(DefaultDDNSIntervalSeconds) * time.Second
 	}
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -589,24 +650,27 @@ func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost st
 					return
 				}
 
-				ak, sk, ok := baiduCredentials()
-				if !ok || ak == "" || sk == "" {
-					continue
-				}
-				zone, sub := deriveZoneAndSub(remoteHost)
-				ip, err := QueryBaiduDNSIP(ak, sk, zone, sub)
-				if err != nil {
-					Logf("DDNS heartbeat: Baidu DNS query failed for %s: %v", id, err)
+				ip, ok := ResolveRealIP(remoteHost)
+				if !ok {
 					continue
 				}
 				if ip != currentIP {
 					Logf("DDNS heartbeat: IP changed %s → %s for %s, restarting tunnel",
 						currentIP, ip, id)
+					// Mark the restart as DDNS-triggered BEFORE killing
+					// the process: handleProcessExit consumes this flag
+					// to skip the retry sleep (the fresh IP is already
+					// confirmed authoritative, so there is nothing to
+					// wait for).
+					m.mu.Lock()
+					sshConn.DDNSRestart = true
+					m.mu.Unlock()
 					if sshConn.Process != nil && sshConn.Process.Process != nil {
 						_ = sshConn.Process.Process.Kill()
 					}
 					return
 				}
+				Logf("DDNS heartbeat: IP OK %s for %s", ip, id)
 			}
 		}
 	}()
@@ -665,17 +729,30 @@ func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 	sshConn.Status = status
 	m.notifyStatus(id, status)
 
-	// Check if auto-reconnect is enabled
+	// Check if auto-reconnect is enabled. Consume the DDNSRestart flag
+	// here (under the lock) so the flag belongs to exactly one restart.
 	if shouldReconnect && sshConn.Config.AutoReconnect {
-		Logf("Auto-reconnect enabled for %s, attempting reconnect...", id)
-		go m.autoReconnect(id)
+		ddnsTriggered := sshConn.DDNSRestart
+		sshConn.DDNSRestart = false
+		if ddnsTriggered {
+			Logf("Auto-reconnect for %s was triggered by a DDNS IP change — skipping the initial retry wait", id)
+		}
+		go m.autoReconnect(id, ddnsTriggered)
 	} else if !shouldReconnect {
 		Logf("Auto-reconnect skipped for %s due to error type: %s", id, status)
 	}
 }
 
-// autoReconnect attempts to reconnect an SSH connection
-func (m *SSHManager) autoReconnect(id string) {
+// autoReconnect attempts to reconnect an SSH connection.
+//
+// ddnsTriggered marks a restart initiated by the DDNS heartbeat (the
+// server IP changed while the tunnel was up). The first attempt of such
+// a restart skips the retry sleep and the explicit DNS flush: the
+// Baidu API has just confirmed the server is alive at its new IP, and
+// resolveConnectTarget flushes the OS cache itself after a successful
+// lookup. Later attempts (and plain failure reconnects) keep the usual
+// wait — whatever went wrong may need time to heal.
+func (m *SSHManager) autoReconnect(id string, ddnsTriggered bool) {
 	m.mu.RLock()
 	sshConn, exists := m.conns[id]
 	m.mu.RUnlock()
@@ -698,40 +775,37 @@ func (m *SSHManager) autoReconnect(id string) {
 	for i := 0; i < maxRetries; i++ {
 		Logf("Auto-reconnect attempt %d/%d for %s", i+1, maxRetries, id)
 
-		// Flush DNS
-		if err := FlushDNS(); err != nil {
-			Logf("DNS flush failed: %v", err)
-		}
-
-		// Wait before retry
-		time.Sleep(time.Duration(retryInterval) * time.Second)
-
-		// Resolve the host to use for the SSH connection.
-		//
-		// In the DDNS scenario the server IP may have changed while the
-		// tunnel was down, but DNS hasn't propagated yet (bounded by the
-		// record TTL). The Baidu DNS API returns the current IP immediately,
-		// so we query it first and fall back to ordinary DNS resolution.
-		hostToUse := cfg.RemoteHost
-		if ak, sk, ok := baiduCredentials(); ok && ak != "" && sk != "" {
-			zone, sub := deriveZoneAndSub(cfg.RemoteHost)
-			if ip, err := QueryBaiduDNSIP(ak, sk, zone, sub); err == nil {
-				hostToUse = ip
-				Logf("autoReconnect: Baidu DNS returned IP %s for %s", ip, cfg.RemoteHost)
-			} else {
-				Logf("autoReconnect: Baidu DNS query failed, falling back to DNS: %v", err)
+		// The first attempt of a DDNS-triggered restart skips the
+		// flush + wait: nothing needs to heal, the new IP is already
+		// authoritative and confirmed reachable.
+		if !(ddnsTriggered && i == 0) {
+			// Flush DNS
+			if err := FlushDNS(); err != nil {
+				Logf("DNS flush failed: %v", err)
 			}
+
+			// Wait before retry
+			time.Sleep(time.Duration(retryInterval) * time.Second)
 		}
 
-		// Try to resolve and reconnect
-		ips, err := ResolveHost(hostToUse)
+		// Check StopCh before doing anything expensive that leads up to
+		// starting a process: if the user disconnected while we were
+		// sleeping/resolving, do not spawn an orphan tunnel.
+		select {
+		case <-sshConn.StopCh:
+			Logf("autoReconnect: StopCh signaled before start, aborting for %s", id)
+			return
+		default:
+		}
+
+		// Resolve the connect target: in the DDNS scenario the server IP
+		// may have changed while the tunnel was down, but DNS hasn't
+		// propagated yet (bounded by the record TTL). The Baidu DNS API
+		// returns the current IP immediately; ordinary DNS is the
+		// fallback.
+		hostToUse, ip, err := resolveConnectTarget(cfg.RemoteHost)
 		if err != nil {
-			Logf("Failed to resolve host %s: %v", hostToUse, err)
-			continue
-		}
-
-		if len(ips) == 0 {
-			Logf("No IPs found for host %s", cfg.RemoteHost)
+			Logf("Failed to resolve host %s: %v", cfg.RemoteHost, err)
 			continue
 		}
 
@@ -751,16 +825,6 @@ func (m *SSHManager) autoReconnect(id string) {
 				Logf("autoReconnect: password pipe failed: %v", err)
 				continue
 			}
-		}
-
-		// Check StopCh before doing anything that starts a process: if
-		// the user disconnected while we were sleeping/resolving, do not
-		// spawn an orphan tunnel.
-		select {
-		case <-sshConn.StopCh:
-			Logf("autoReconnect: StopCh signaled before start, aborting for %s", id)
-			return
-		default:
 		}
 
 		// Start SSH process
@@ -791,11 +855,11 @@ func (m *SSHManager) autoReconnect(id string) {
 		sshConn.Process = cmd
 		sshConn.Status = "connecting"
 		m.notifyStatus(id, "connecting")
-		sshConn.CurrentIP = ips[0]
+		sshConn.CurrentIP = ip
 		m.mu.Unlock()
 
 		Logf("SSH tunnel reconnected: %s -> %s:%d via %s (IP: %s)",
-			cfg.Name, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ips[0])
+			cfg.Name, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ip)
 
 		// Start monitoring again
 		go m.monitorProcess(id)
@@ -935,31 +999,10 @@ func (m *SSHManager) GetActiveConnections() []string {
 // Useful for debugging and testing. NOTE: the returned string omits the
 // sshpass wrapper and password argument — it shows the underlying ssh
 // invocation only, so it never leaks credentials into logs or test output.
+// The host shown is the configured hostname; at runtime the tunnel
+// connects to the IP resolved by resolveConnectTarget instead.
 func FormatSSHCommand(cfg ForwardConfig) string {
-	forwardFlag := "-L"
-	if cfg.ForwardType == "remote" {
-		forwardFlag = "-R"
-	}
-
-	forwardTarget := "127.0.0.1"
-	if cfg.ForwardType == "remote" {
-		if cfg.LocalHost != "" {
-			forwardTarget = cfg.LocalHost
-		}
-	}
-
-	args := []string{
-		forwardFlag, fmt.Sprintf("%d:%s:%d", cfg.LocalPort, forwardTarget, cfg.RemotePort),
-		"-N",
-		"-o", "ServerAliveInterval=60",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "ExitOnForwardFailure=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "UserKnownHostsFile=" + knownHostsPath(),
-		"-l", cfg.SSHUser,
-		cfg.RemoteHost,
-	}
-	return "ssh " + strings.Join(args, " ")
+	return "ssh " + strings.Join(sshArgs(cfg, cfg.RemoteHost), " ")
 }
 
 // FormatSSHCommandForType is identical to FormatSSHCommand but exists
