@@ -6,7 +6,7 @@
 // Chinese or ASCII colon), searched next to the executable and in the
 // working directory, so no secret is embedded in source.
 //
-// Usage: querydns [zone]   (default: ruanjiangongcheng.site)
+// Usage: querydns <zone>   (e.g.: querydns example.com)
 package main
 
 import (
@@ -23,8 +23,6 @@ import (
 	"time"
 	"unicode/utf8"
 )
-
-const defaultZone = "ruanjiangongcheng.site"
 
 const signExpiration = "1800"
 
@@ -123,10 +121,11 @@ func parseBaiduKey(path string) (string, string, error) {
 }
 
 func main() {
-	zone := defaultZone
-	if len(os.Args) > 1 {
-		zone = os.Args[1]
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "用法: querydns <zone>   (例如: querydns example.com)")
+		os.Exit(2)
 	}
+	zone := os.Args[1]
 
 	ak, sk, err := loadCredentials()
 	if err != nil {

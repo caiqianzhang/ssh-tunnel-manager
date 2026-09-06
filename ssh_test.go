@@ -2,11 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -624,7 +628,7 @@ func TestDDNSHeartbeatExitsOnStopCh(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		mgr.startDDNSMonitor("hb-stop", conn, "localhost")
+		mgr.startDDNSMonitor("hb-stop", conn, "localhost", 0)
 		close(done)
 	}()
 
@@ -656,7 +660,7 @@ func TestDDNSHeartbeatExitsWhenNotRunning(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		mgr.startDDNSMonitor("hb-notrunning", conn, "localhost")
+		mgr.startDDNSMonitor("hb-notrunning", conn, "localhost", 0)
 		close(done)
 	}()
 
@@ -723,7 +727,7 @@ func TestDDNSHeartbeatKillsProcessOnIPChange(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		mgr.startDDNSMonitor("hb-ipchange", conn, "localhost")
+		mgr.startDDNSMonitor("hb-ipchange", conn, "localhost", 0)
 		close(done)
 	}()
 
@@ -939,4 +943,180 @@ func TestAutoReconnectSkipsSleepOnDDNSTrigger(t *testing.T) {
 		t.Errorf("plain reconnect did not wait out the retry sleep: %v", plainElapsed)
 	}
 	t.Logf("ddns-triggered=%v plain=%v", ddnsElapsed, plainElapsed)
+}
+
+// ---------- notify 串行化 ----------
+
+// TestNotifyStatusDeliversInOrder pins the serialized dispatcher:
+// transitions reach the callback in the order they were queued — an
+// out-of-order stale "disconnected" after "connecting" made the UI
+// show a dead tunnel.
+func TestNotifyStatusDeliversInOrder(t *testing.T) {
+	m := NewSSHManager()
+
+	var mu sync.Mutex
+	var got []string
+	last := make(chan string, 1)
+	m.SetOnStatusChange(func(id, status string) {
+		mu.Lock()
+		got = append(got, status)
+		cur := status
+		mu.Unlock()
+		select {
+		case last <- cur:
+		default:
+		}
+	})
+
+	m.notifyStatus("x", "connecting")
+	m.notifyStatus("x", "running")
+	m.notifyStatus("x", "disconnected")
+
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		cur := got
+		mu.Unlock()
+		if len(cur) == 3 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("dispatcher did not deliver all transitions: %v", cur)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"connecting", "running", "disconnected"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("out-of-order delivery: got %v, want %v", got, want)
+	}
+}
+
+// TestNotifyStatusDropsOldestWhenFull verifies the queue-full policy:
+// the oldest entry is dropped, the newest is kept, and the caller never
+// blocks.
+//
+// Uses a bare SSHManager (no dispatcher goroutine): with the real
+// dispatcher running it would race this test's manual receives and the
+// final receive could block forever on an empty channel.
+func TestNotifyStatusDropsOldestWhenFull(t *testing.T) {
+	m := &SSHManager{notifyCh: make(chan notifyMsg, 64)}
+
+	total := cap(m.notifyCh) + 1
+	for i := 0; i < total; i++ {
+		m.notifyStatus("x", fmt.Sprintf("s%d", i))
+	}
+
+	if len(m.notifyCh) != cap(m.notifyCh) {
+		t.Fatalf("queue length = %d, want %d", len(m.notifyCh), cap(m.notifyCh))
+	}
+	var last notifyMsg
+	first := true
+	for len(m.notifyCh) > 0 {
+		msg := <-m.notifyCh
+		if first {
+			first = false
+			if msg.status != "s1" {
+				t.Errorf("oldest entry = %q, want s1 (s0 should have been dropped)", msg.status)
+			}
+		}
+		last = msg
+	}
+	if last.status != fmt.Sprintf("s%d", total-1) {
+		t.Errorf("newest message lost: got %q", last.status)
+	}
+}
+
+// ---------- DDNS 心跳代际退役 ----------
+
+// TestDDNSHeartbeatRetiresOnGenerationBump is the regression test for
+// the heartbeat monitor leak: a monitor whose generation has been
+// superseded must retire WITHOUT killing the tunnel, even when its
+// in-flight API call returns a mismatched IP.
+func TestDDNSHeartbeatRetiresOnGenerationBump(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: requires process signals")
+	}
+
+	// The first API call blocks on the gate so we can bump the
+	// generation while the monitor is inside its network call — the
+	// exact window where the old code acted on a stale snapshot.
+	gate := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-gate
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 1, "domain": "@", "rdtype": "A",
+					"rdata": "5.6.7.8", "zoneName": "localhost", "status": "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	origBase := baiduDNSAPIBase
+	baiduDNSAPIBase = server.URL
+	t.Cleanup(func() { baiduDNSAPIBase = origBase })
+
+	setBaiduCredsForTest(t, "AK-test", "SK-test")
+	defer clearBaiduCredsForTest(t)
+
+	mgr := NewSSHManager()
+	mgr.ddnsCheckInterval = 20 * time.Millisecond
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID: "hb-retire", RemoteHost: "localhost", RemotePort: 22,
+			LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+		},
+		Status:    "running",
+		CurrentIP: "1.2.3.4",
+		StopCh:    make(chan struct{}),
+		Process:   cmd,
+		DDNSGen:   1, // matches the generation passed to startDDNSMonitor
+	}
+
+	// Generation 1 is the one that will be bumped.
+	mgr.startDDNSMonitor("hb-retire", conn, "localhost", 1)
+
+	// Wait until the monitor is inside its first API call.
+	deadline := time.After(2 * time.Second)
+	for requests.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("heartbeat never queried the API")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Reconnect simulation: a newer generation claims the connection.
+	mgr.mu.Lock()
+	conn.DDNSGen = 2
+	mgr.mu.Unlock()
+	close(gate)
+
+	// Give the monitor time to observe the bump. It must return
+	// without killing the process and without polling again.
+	time.Sleep(300 * time.Millisecond)
+
+	if requests.Load() != 1 {
+		t.Errorf("retired monitor kept polling: %d requests, want 1", requests.Load())
+	}
+	// Signal 0 probes liveness without actually signalling.
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Error("superseded monitor killed the tunnel process")
+	}
 }

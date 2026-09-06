@@ -652,3 +652,33 @@ func TestConflictDialogStateIsQueuedNotTouched(t *testing.T) {
 		t.Errorf("unexpected port %d", ui.portConflictPort)
 	}
 }
+
+// TestCheckPortAndConnectIgnoresClickWhileBusy pins the connect-button
+// re-entrancy guard: while a connect attempt is in flight
+// (connectBusy), further clicks must be silently swallowed — without
+// the guard, two racing attempts both pass the 150ms port check and
+// the loser reports "连接失败: connection already exists" while the
+// tunnel actually came up.
+func TestCheckPortAndConnectIgnoresClickWhileBusy(t *testing.T) {
+	cfg := NewConfigManager("test_config.json")
+	ui := NewUI(cfg, NewSSHManager())
+
+	checkerCalled := false
+	ui.portChecker = func(port int) (bool, string, error) {
+		checkerCalled = true
+		return false, "", nil
+	}
+
+	ui.connectBusy = true
+	ui.checkPortAndConnect(ForwardConfig{
+		ID: "busy-guard", RemoteHost: "r", RemotePort: 22,
+		LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+	})
+
+	if checkerCalled {
+		t.Error("portChecker ran despite connectBusy — re-entrancy guard missing")
+	}
+	if ui.testResult == "连接中..." {
+		t.Error("connect attempt started despite connectBusy")
+	}
+}

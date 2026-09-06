@@ -28,11 +28,13 @@ type SSHConn struct {
 	// IP, so waiting would only prolong the blackout. Guarded by the
 	// manager's mu.
 	//
-	// DDNSGen identifies the current DDNS-monitor generation. Every
-	// startDDNSMonitor call claims a new generation; older monitors
-	// retire themselves when they observe the bump (without this, a
-	// monitor that misses the brief non-running window around a
-	// reconnect would leak and keep polling the API forever).
+	// DDNSGen identifies the current DDNS-monitor generation. It is
+	// bumped in the same critical section that publishes "running"
+	// (monitorProcess) and the value is handed to startDDNSMonitor;
+	// heartbeats from older generations retire themselves when they
+	// observe the bump (without this, a monitor that misses the brief
+	// non-running window around a reconnect would leak and keep
+	// polling the API forever). Guarded by the manager's mu.
 	DDNSGen     uint64
 	DDNSRestart bool
 	mu          sync.Mutex
@@ -633,12 +635,25 @@ func (m *SSHManager) monitorProcess(id string) {
 		return
 	case <-time.After(confirmWindow):
 		// Process survived the window — mark as running.
+		var gen uint64
 		m.mu.Lock()
 		if _, stillExists := m.conns[id]; stillExists {
 			sshConn.Status = "running"
+			// Claim the DDNS monitor generation in the SAME critical
+			// section that publishes "running": heartbeats from older
+			// generations retire at their next check, which closes the
+			// window where an old monitor could act on a stale
+			// snapshot taken before the reconnect.
+			sshConn.DDNSGen++
+			gen = sshConn.DDNSGen
 			m.notifyStatus(id, "running")
 		}
 		m.mu.Unlock()
+		if gen == 0 {
+			// The conn was disconnected during the confirm window —
+			// nothing to monitor.
+			return
+		}
 
 		// Start the DDNS heartbeat: if the server's IP changes while the
 		// tunnel is up (the DDNS scenario), the old tunnel becomes a
@@ -650,7 +665,7 @@ func (m *SSHManager) monitorProcess(id string) {
 		// to. On a mismatch it kills the SSH process, which routes
 		// through the existing handleProcessExit → autoReconnect path
 		// (which itself re-queries Baidu DNS for the fresh IP).
-		m.startDDNSMonitor(id, sshConn, sshConn.Config.RemoteHost)
+		m.startDDNSMonitor(id, sshConn, sshConn.Config.RemoteHost, gen)
 	}
 
 	// Process is confirmed running; now wait for it to actually exit.
@@ -670,34 +685,30 @@ func (m *SSHManager) monitorProcess(id string) {
 	m.handleProcessExit(id, err, sshConn)
 }
 
-// startDDNSMonitor periodically checks whether the server's IP has
-// changed via the Baidu DNS API. In the DDNS scenario the server IP can
-// change while the tunnel is up; the old SSH process keeps running but
-// forwards to a dead or wrong server. Without this check the app would
-// not notice until the SSH keepalive (3 min) or a TCP timeout finally
-// killed the process.
+// startDDNSMonitor launches the DDNS heartbeat for monitor generation
+// gen (claimed by the caller in the same critical section that
+// publishes "running" — see monitorProcess).
 //
-// On a mismatch it kills the SSH process, which routes through the
-// existing handleProcessExit → autoReconnect path. That path re-queries
-// Baidu DNS, so the new tunnel lands on the fresh IP.
+// Every interval it queries the Baidu DNS API for the domain's current
+// IP and compares it to the IP the tunnel is actually connected to; on
+// a mismatch it marks DDNSRestart and kills the SSH process, which
+// routes through the existing handleProcessExit → autoReconnect path
+// (that path re-queries Baidu DNS, so the new tunnel lands on the
+// fresh IP). Without this check a DDNS change while the tunnel is up
+// would go unnoticed until the SSH keepalive (3 min) or a TCP timeout
+// finally killed a process that was already forwarding into a black
+// hole.
 //
-// The goroutine exits when StopCh is closed (Disconnect), so it never
-// outlives the connection it monitors.
-func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost string) {
+// The goroutine exits when StopCh closes (Disconnect), when the
+// connection is no longer "running", or when a newer generation
+// claims the connection — it never outlives the tunnel it monitors.
+func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost string, gen uint64) {
+	m.mu.RLock()
 	interval := m.ddnsCheckInterval
+	m.mu.RUnlock()
 	if interval <= 0 {
 		interval = time.Duration(DefaultDDNSIntervalSeconds) * time.Second
 	}
-	// Claim a monitor generation. An older monitor still ticking for
-	// this connection (e.g. one started before the last reconnect)
-	// observes the bump and retires itself — without this, every
-	// reconnect whose non-running window is shorter than one tick
-	// leaks a heartbeat that keeps polling the API and can kill the
-	// newer tunnel.
-	m.mu.Lock()
-	sshConn.DDNSGen++
-	gen := sshConn.DDNSGen
-	m.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

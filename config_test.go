@@ -387,3 +387,33 @@ func TestDDNSCheckIntervalRoundTrip(t *testing.T) {
 		t.Errorf("expected unset ddns_check_interval to stay 0, got %d", got)
 	}
 }
+
+// TestSaveRefusesWhenReadOnly pins the data-loss protection: when the
+// initial Load failed (corrupt file, missing secret key), Save must
+// refuse to overwrite the on-disk config with in-memory defaults, and
+// must work again once the protection is lifted.
+func TestSaveRefusesWhenReadOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := `{"forwards":[{"id":"keep-me","name":"real"}]}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager(path)
+	cm.SetReadOnly(true)
+	if err := cm.Save(); err == nil {
+		t.Fatal("expected Save to refuse while read-only")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != original {
+		t.Errorf("read-only Save modified the file:\n%s", data)
+	}
+
+	cm.SetReadOnly(false)
+	if err := cm.Save(); err != nil {
+		t.Fatalf("Save after lifting protection failed: %v", err)
+	}
+}

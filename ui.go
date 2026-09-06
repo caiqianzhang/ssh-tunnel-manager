@@ -186,6 +186,11 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.apiKeyEntry.SingleLine = true
 	u.apiKeyEntry.Mask = '•' // Mask the API key for security
 	u.ddnsIntervalEntry.SingleLine = true
+	// Mask the stored SSH password too: it would otherwise sit in
+	// plaintext on screen for the whole session, and saveSettings'
+	// "empty field = keep stored password" rule only makes sense for a
+	// masked field.
+	u.sshPasswordEntry.Mask = '•'
 
 	u.forwardLocal.Value = true
 	u.autoReconnect.Value = true
@@ -541,6 +546,11 @@ func (ui *UI) handleChangePort() {
 
 	ui.setTestResult(fmt.Sprintf("端口已更改为 %d，正在连接...", newPort), true)
 	ui.showPortConflictDialog = false
+	// Reload the form from the updated config: without this the editors
+	// still show the old port, and the next 保存设置 would silently
+	// roll the port back while the running tunnel listens on the new
+	// one.
+	ui.loadConfigToForm()
 
 	// Try to connect with new port asynchronously. conflictBusy stays
 	// true until the connect finishes so repeat clicks cannot spawn a
@@ -763,6 +773,10 @@ func (ui *UI) saveSettings() {
 	// its current cycle first).
 	if ddnsInterval > 0 {
 		ui.ssh.SetDDNSCheckInterval(time.Duration(ddnsInterval) * time.Second)
+	} else {
+		// 0/unset means "use the default": restore the built-in period
+		// so clearing the field live-resets a previously custom value.
+		ui.ssh.SetDDNSCheckInterval(time.Duration(DefaultDDNSIntervalSeconds) * time.Second)
 	}
 
 	// Bug 5: report save failure to the user and keep them on the

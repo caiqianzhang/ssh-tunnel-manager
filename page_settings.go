@@ -61,8 +61,19 @@ func (ui *UI) settingsCardAdvanced(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(checkbox(&ui.forwardLocal, "本地转发 (-L)")),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(ui.zoneForwardRow),
+			layout.Rigid(layout.Spacer{Height: 12}.Layout),
+			layout.Rigid(ui.versionRow),
 		)
 	})
+}
+
+// versionRow shows the build version (injected via -ldflags at build
+// time; "dev" for hand-built binaries).
+func (ui *UI) versionRow(gtx layout.Context) layout.Dimensions {
+	lbl := material.Caption(ui.theme, "版本 "+appVersion)
+	lbl.Color = ColorGray
+	lbl.TextSize = unit.Sp(11)
+	return lbl.Layout(gtx)
 }
 
 func (ui *UI) settingsSaveBtn(gtx layout.Context) layout.Dimensions {
@@ -239,6 +250,13 @@ func (ui *UI) zoneForwardRow(gtx layout.Context) layout.Dimensions {
 	caption := ui.zoneActionLabel
 	if ui.zoneBusy {
 		caption = "执行中…"
+	}
+
+	// 未配置域名 / 查询失败: nothing actionable — status line only.
+	// Falling through to the button branch here would render a wide,
+	// caption-less blue button that silently ignores clicks.
+	if ui.zonePending == "" {
+		return status(gtx)
 	}
 
 	// Up to date: status line with a demoted 移除 text link.

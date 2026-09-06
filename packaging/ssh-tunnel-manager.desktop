@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SSH 隧道管理器
+Name[en]=SSH Tunnel Manager
+Comment=管理 SSH 端口转发，DDNS 变更自动跟随
+Comment[en]=Manage SSH port forwards with DDNS fast-path
+Exec=ssh-tunnel-manager
+Icon=ssh-tunnel-manager
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=false

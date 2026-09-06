@@ -121,10 +121,12 @@ func findBaiduKey() (string, error) {
 //
 // Expected format (one per line, Chinese or ASCII colon):
 //
-//	Secret：1bf13f09a545436faef3125e5aadf2d7
-//	key：ALTAKNkj6MSaxHg4WHRVGnYHzx
+//	Secret：<your_secret_key>
+//	key：<your_access_key>
 //
-// where "key" maps to AK and "Secret" maps to SK.
+// where "key" maps to AK and "Secret" maps to SK. Never put real
+// credentials in this comment — they live only in the git-ignored
+// baidu.key file.
 func LoadBaiduCredentials(path string) (ak, sk string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

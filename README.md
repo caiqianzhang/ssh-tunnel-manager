@@ -35,12 +35,36 @@ lets you connect, disconnect and restore the window.
 Requirements: Go 1.26+, an SSH client in `PATH`, and `sshpass` if you
 use password authentication (key-based auth also works).
 
+On a clean Linux box, Gio's CGO backend also needs the graphics dev
+headers (Ubuntu/Debian package names):
+
+```sh
+sudo apt install build-essential pkg-config \
+    libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+    libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+```
+
 ```sh
 make build            # Linux binary -> build/ssh-tunnel-manager
 make build-windows    # Windows binary -> build/ssh-tunnel-manager.exe
 make test
 ./build/ssh-tunnel-manager
 ```
+
+The build stamps the version (git describe) into the binary; the
+settings page shows it. Optional runtime helpers are auto-detected:
+`pkexec` + `resolvectl` power the 域名解析优化 row in settings.
+
+### Desktop integration (optional, Linux)
+
+```sh
+sudo make install     # binary to /usr/local/bin + menu entry + icon
+```
+
+Afterwards the app starts from the desktop menu with its own icon.
+Uninstall by removing `/usr/local/bin/ssh-tunnel-manager`,
+`/usr/local/bin/querydns`, and the ssh-tunnel-manager entries under
+`/usr/local/share/applications` and `/usr/local/share/icons`.
 
 ## Configuration
 

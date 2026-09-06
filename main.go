@@ -27,6 +27,11 @@ var (
 	// process and is reused across windows.
 	uiMu  sync.Mutex
 	appUI *UI
+
+	// appVersion is injected at build time via
+	// -ldflags "-X main.appVersion=..." (see Makefile); "dev" when
+	// built by hand.
+	appVersion = "dev"
 )
 
 func setAppUI(ui *UI) {
@@ -189,6 +194,18 @@ func main() {
 				return
 			}
 			fwd := forwards[0]
+			// Don't fight our own tunnel: while it is connecting, its
+			// ssh process already binds the local port, so a naive
+			// port check would flag our own socket as a conflict and
+			// let the user kill their own tunnel.
+			switch sshMgr.GetStatus(fwd.ID) {
+			case "running":
+				sshMgr.Disconnect(fwd.ID)
+				return
+			case "connecting":
+				Log("trayConnect: tunnel is connecting — ignoring click")
+				return
+			}
 			inUse, processInfo, err := CheckPortInUse(fwd.LocalPort)
 			if err != nil {
 				return
