@@ -1,4 +1,6 @@
-# Build artifacts
+# Build artifacts (the Makefile writes them to build/, but a plain
+# `go build .` in the root still drops them here — ignore both).
+build/
 ssh-tunnel-manager
 ssh-tunnel-manager-linux
 ssh-tunnel-manager.exe

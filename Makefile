@@ -1,16 +1,23 @@
 .PHONY: build build-linux build-windows clean test
 
+# Build outputs go to build/ so the project root stays clean — only
+# source files live at the top level.
+BUILD_DIR := build
+
 build:
-	go build -o ssh-tunnel-manager .
+	mkdir -p $(BUILD_DIR)
+	go build -o $(BUILD_DIR)/ssh-tunnel-manager .
 
 build-linux:
-	GOOS=linux GOARCH=amd64 go build -o ssh-tunnel-manager-linux .
+	mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/ssh-tunnel-manager-linux .
 
 build-windows:
-	GOOS=windows GOARCH=amd64 go build -o ssh-tunnel-manager.exe .
+	mkdir -p $(BUILD_DIR)
+	GOOS=windows GOARCH=amd64 go build -o $(BUILD_DIR)/ssh-tunnel-manager.exe .
 
 clean:
-	rm -f ssh-tunnel-manager ssh-tunnel-manager-linux ssh-tunnel-manager.exe
+	rm -rf $(BUILD_DIR)
 
 test:
 	go test -v ./...
