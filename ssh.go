@@ -516,6 +516,18 @@ func (m *SSHManager) monitorProcess(id string) {
 			m.notifyStatus(id, "running")
 		}
 		m.mu.Unlock()
+
+		// Start the DDNS heartbeat: if the server's IP changes while the
+		// tunnel is up (the DDNS scenario), the old tunnel becomes a
+		// black hole — new connections through the local port reach a
+		// dead or wrong server, but the SSH process keeps running.
+		//
+		// The heartbeat periodically queries Baidu DNS for the current
+		// IP and compares it to the IP the tunnel is actually connected
+		// to. On a mismatch it kills the SSH process, which routes
+		// through the existing handleProcessExit → autoReconnect path
+		// (which itself re-queries Baidu DNS for the fresh IP).
+		m.startDDNSMonitor(id, sshConn, sshConn.Config.RemoteHost)
 	}
 
 	// Process is confirmed running; now wait for it to actually exit.
@@ -533,6 +545,62 @@ func (m *SSHManager) monitorProcess(id string) {
 	// checks whether the connection is still tracked before doing
 	// anything, so we do not need to hold the lock here.
 	m.handleProcessExit(id, err, sshConn)
+}
+
+// startDDNSMonitor periodically checks whether the server's IP has
+// changed via the Baidu DNS API. In the DDNS scenario the server IP can
+// change while the tunnel is up; the old SSH process keeps running but
+// forwards to a dead or wrong server. Without this check the app would
+// not notice until the SSH keepalive (3 min) or a TCP timeout finally
+// killed the process.
+//
+// On a mismatch it kills the SSH process, which routes through the
+// existing handleProcessExit → autoReconnect path. That path re-queries
+// Baidu DNS, so the new tunnel lands on the fresh IP.
+//
+// The goroutine exits when StopCh is closed (Disconnect), so it never
+// outlives the connection it monitors.
+func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost string) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sshConn.StopCh:
+				return
+			case <-ticker.C:
+				// If the tunnel is no longer running (process exited,
+				// handleProcessExit already fired, autoReconnect is
+				// underway with its own heartbeat), stop monitoring.
+				m.mu.RLock()
+				status := sshConn.Status
+				currentIP := sshConn.CurrentIP
+				m.mu.RUnlock()
+				if status != "running" {
+					return
+				}
+
+				ak, sk, ok := baiduCredentials()
+				if !ok || ak == "" || sk == "" {
+					continue
+				}
+				zone, sub := deriveZoneAndSub(remoteHost)
+				ip, err := QueryBaiduDNSIP(ak, sk, zone, sub)
+				if err != nil {
+					Logf("DDNS heartbeat: Baidu DNS query failed for %s: %v", id, err)
+					continue
+				}
+				if ip != currentIP {
+					Logf("DDNS heartbeat: IP changed %s → %s for %s, restarting tunnel",
+						currentIP, ip, id)
+					if sshConn.Process != nil && sshConn.Process.Process != nil {
+						_ = sshConn.Process.Process.Kill()
+					}
+					return
+				}
+			}
+		}
+	}()
 }
 
 // handleProcessExit classifies the exit error, updates status, and
