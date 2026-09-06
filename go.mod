@@ -1,12 +1,22 @@
-module port
+module github.com/ssh-tunnel-manager/ssh-tunnel-manager
 
 go 1.26.6
 
-require gioui.org v0.10.2
+require (
+	fyne.io/systray v1.12.2
+	gioui.org v0.10.2
+)
+
+// Vendored copy with a one-line fix for the wayland clipboard-read wedge:
+// app/os_wayland.go ReadClipboard() did not reset readClipClose when no
+// selection offer was pending, permanently disabling all clipboard reads
+// (Ctrl+V / paste) after any too-early read. See third_party/gio/LICENSE.
+replace gioui.org => ./third_party/gio
 
 require (
 	gioui.org/shader v1.0.9 // indirect
 	github.com/go-text/typesetting v0.3.4 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/image v0.26.0 // indirect
 	golang.org/x/net v0.48.0 // indirect

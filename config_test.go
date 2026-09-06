@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -172,5 +174,122 @@ func TestConfigManagerLoadSave(t *testing.T) {
 	}
 	if forwards[0].ID != "mgr-test" {
 		t.Errorf("expected ID 'mgr-test', got '%s'", forwards[0].ID)
+	}
+}
+
+// Bug 16: GetForwards must return a deep copy so external mutation
+// cannot bypass the ConfigManager's locking/validation.
+func TestGetForwardsReturnsDeepCopy(t *testing.T) {
+	cm := NewConfigManager("/tmp/test_deep_copy.json")
+	cm.AddForward(ForwardConfig{
+		ID: "x", Name: "original", RemoteHost: "r", RemotePort: 1,
+		LocalHost: "l", LocalPort: 2, SSHUser: "u",
+	})
+
+	got := cm.GetForwards()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 forward, got %d", len(got))
+	}
+	// Mutate the returned slice & element.
+	got[0].Name = "mutated"
+	got = append(got, ForwardConfig{ID: "y"})
+
+	// Re-read; state must be unchanged.
+	again := cm.GetForwards()
+	if again[0].Name != "original" {
+		t.Errorf("GetForwards leaked mutation; got Name=%q", again[0].Name)
+	}
+	if len(again) != 1 {
+		t.Errorf("GetForwards leaked appended element; got %d forwards", len(again))
+	}
+}
+
+// Bug 16: GetForward must also return a copy (by value, since
+// ForwardConfig contains no pointer fields, value semantics already
+// achieve this — but the test guards the contract).
+func TestGetForwardReturnsCopy(t *testing.T) {
+	cm := NewConfigManager("/tmp/test_get_copy.json")
+	cm.AddForward(ForwardConfig{
+		ID: "g", Name: "n", RemoteHost: "r", RemotePort: 1,
+		LocalHost: "l", LocalPort: 2, SSHUser: "u",
+	})
+	got, ok := cm.GetForward("g")
+	if !ok {
+		t.Fatal("expected found")
+	}
+	got.Name = "mutated"
+	again, _ := cm.GetForward("g")
+	if again.Name != "n" {
+		t.Errorf("GetForward returned aliased value; got Name=%q", again.Name)
+	}
+}
+
+// Bug 4: passwords must be encrypted on Save and decrypted on Load.
+// Raw file bytes must NOT contain the plaintext password.
+func TestConfigEncryptsPasswordOnDisk(t *testing.T) {
+	tmp := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmp)
+	defer os.Chdir(oldWd)
+
+	const secret = "my-SSH-password-123"
+	cfgFile := filepath.Join(tmp, "test_enc.json")
+	cm := NewConfigManager(cfgFile)
+	cm.AddForward(ForwardConfig{
+		ID: "p", Name: "pw", RemoteHost: "r", RemotePort: 22,
+		LocalHost: "l", LocalPort: 2222, SSHUser: "u",
+		SSHPassword: secret,
+	})
+	if err := cm.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Errorf("config file contains plaintext password:\n%s", string(raw))
+	}
+
+	// Reload and verify decryption.
+	cm2 := NewConfigManager(cfgFile)
+	if err := cm2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := cm2.GetForward("p")
+	if !ok {
+		t.Fatal("expected to find forward")
+	}
+	if got.SSHPassword != secret {
+		t.Errorf("decryption failed: got %q want %q", got.SSHPassword, secret)
+	}
+}
+
+// Bug 4b: pre-existing plaintext config files must still load.
+func TestConfigLoadsLegacyPlaintextPassword(t *testing.T) {
+	tmp := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmp)
+	defer os.Chdir(oldWd)
+
+	const secret = "legacy-plain-pw"
+	cfgFile := filepath.Join(tmp, "test_legacy.json")
+	// Write raw legacy-style JSON.
+	legacy := `{"forwards":[{"id":"l","name":"l","forward_type":"local","remote_host":"r","remote_port":22,"local_host":"l","local_port":2222,"ssh_user":"u","ssh_password":"` + secret + `","auto_reconnect":false,"max_retries":3,"retry_interval":5}],"settings":{}}`
+	if err := os.WriteFile(cfgFile, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager(cfgFile)
+	if err := cm.Load(); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := cm.GetForward("l")
+	if !ok {
+		t.Fatal("expected to find forward")
+	}
+	if got.SSHPassword != secret {
+		t.Errorf("legacy plaintext not preserved: got %q want %q", got.SSHPassword, secret)
 	}
 }

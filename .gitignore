@@ -1,0 +1,17 @@
+# Build artifacts
+ssh-tunnel-manager
+ssh-tunnel-manager-linux
+ssh-tunnel-manager.exe
+
+# Runtime files (generated, never commit)
+ssh-tunnel-manager.log
+secret.key
+config.json
+
+# Vendored third-party deps are tracked (see third_party/),
+# but build cache and module downloads are not.
+/vendor/
+
+# Editor / OS
+.DS_Store
+*.swp
