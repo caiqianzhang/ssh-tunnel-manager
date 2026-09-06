@@ -38,6 +38,10 @@ type SSHManager struct {
 	// buildSSHCommand; tests can override it to use a fake SSH binary
 	// (e.g. sleep) instead of spawning a real ssh process.
 	commandBuilder func(ForwardConfig, string) *exec.Cmd
+
+	// ddnsCheckInterval is the period between Baidu DNS IP checks in
+	// startDDNSMonitor. Defaults to 30s; tests override it to tick fast.
+	ddnsCheckInterval time.Duration
 }
 
 // NewSSHManager creates a new SSHManager
@@ -47,6 +51,7 @@ func NewSSHManager() *SSHManager {
 		commandBuilder: func(cfg ForwardConfig, host string) *exec.Cmd {
 			return buildSSHCommand(cfg)
 		},
+		ddnsCheckInterval: 30 * time.Second,
 	}
 }
 
@@ -561,8 +566,12 @@ func (m *SSHManager) monitorProcess(id string) {
 // The goroutine exits when StopCh is closed (Disconnect), so it never
 // outlives the connection it monitors.
 func (m *SSHManager) startDDNSMonitor(id string, sshConn *SSHConn, remoteHost string) {
+	interval := m.ddnsCheckInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {

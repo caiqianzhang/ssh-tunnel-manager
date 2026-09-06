@@ -599,3 +599,150 @@ func TestAutoReconnectUsesBaiduDNS(t *testing.T) {
 	// 11. Clean up.
 	_ = mgr.Disconnect(cfg.ID)
 }
+
+// ---------- DDNS heartbeat ----------
+
+// TestDDNSHeartbeatExitsOnStopCh verifies the heartbeat goroutine exits
+// immediately when StopCh is already closed (simulating Disconnect).
+func TestDDNSHeartbeatExitsOnStopCh(t *testing.T) {
+	mgr := NewSSHManager()
+	mgr.ddnsCheckInterval = 50 * time.Millisecond
+
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID: "hb-stop", RemoteHost: "localhost", RemotePort: 22,
+			LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+		},
+		Status:    "running",
+		CurrentIP: "1.2.3.4",
+		StopCh: func() chan struct{} {
+			c := make(chan struct{})
+			close(c)
+			return c
+		}(),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.startDDNSMonitor("hb-stop", conn, "localhost")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DDNS heartbeat did not exit on closed StopCh")
+	}
+}
+
+// TestDDNSHeartbeatExitsWhenNotRunning verifies the heartbeat exits on
+// the first tick if the tunnel is no longer "running" (e.g. the process
+// already exited and handleProcessExit fired). This prevents goroutine
+// leaks when a tunnel is killed externally and autoReconnect spawns a
+// new conn with its own heartbeat.
+func TestDDNSHeartbeatExitsWhenNotRunning(t *testing.T) {
+	mgr := NewSSHManager()
+	mgr.ddnsCheckInterval = 50 * time.Millisecond
+
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID: "hb-notrunning", RemoteHost: "localhost", RemotePort: 22,
+			LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+		},
+		Status:    "disconnected",
+		CurrentIP: "1.2.3.4",
+		StopCh:    make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.startDDNSMonitor("hb-notrunning", conn, "localhost")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DDNS heartbeat did not exit when tunnel not running")
+	}
+}
+
+// TestDDNSHeartbeatKillsProcessOnIPChange is the end-to-end test of the
+// heartbeat's core job: when Baidu DNS reports a different IP than the
+// one the tunnel is connected to, the heartbeat kills the SSH process
+// so the existing handleProcessExit → autoReconnect path can rebuild
+// the tunnel with the fresh IP.
+func TestDDNSHeartbeatKillsProcessOnIPChange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: requires process signals")
+	}
+
+	// Mock Baidu DNS server returning a different IP than the tunnel's
+	// CurrentIP ("1.2.3.4" → "5.6.7.8").
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 1, "domain": "@", "rdtype": "A",
+					"rdata": "5.6.7.8", "zoneName": "localhost", "status": "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	origBase := baiduDNSAPIBase
+	baiduDNSAPIBase = server.URL
+	t.Cleanup(func() { baiduDNSAPIBase = origBase })
+
+	setBaiduCredsForTest(t, "AK-test", "SK-test")
+	defer clearBaiduCredsForTest(t)
+
+	mgr := NewSSHManager()
+	mgr.ddnsCheckInterval = 50 * time.Millisecond
+
+	// Start a fake SSH process (sleep) that the heartbeat can kill.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure the test process is cleaned up regardless.
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID: "hb-ipchange", RemoteHost: "localhost", RemotePort: 22,
+			LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+		},
+		Status:    "running",
+		CurrentIP: "1.2.3.4",
+		StopCh:    make(chan struct{}),
+		Process:   cmd,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.startDDNSMonitor("hb-ipchange", conn, "localhost")
+		close(done)
+	}()
+
+	// The heartbeat should detect the IP mismatch and kill the process.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DDNS heartbeat did not fire on IP change")
+	}
+
+	// Verify the process was actually killed (Wait returns immediately).
+	exited := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+	case <-time.After(1 * time.Second):
+		t.Error("process was not killed by DDNS heartbeat")
+	}
+}
