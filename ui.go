@@ -274,37 +274,44 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	}
 }
 
-// checkPortAndConnect checks if a port is in use and either shows the conflict dialog or connects.
-// Returns true if connection was initiated (or already running), false if dialog was shown.
-func (ui *UI) checkPortAndConnect(fwd ForwardConfig) bool {
+// checkPortAndConnect checks if a port is in use and either shows the
+// conflict dialog or connects. The connect path runs in a goroutine so
+// DNS resolution and SSH start cannot freeze the UI; results arrive
+// later via setTestResult / showPortConflictDialog.
+func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
+	// Fast path: already running — disconnect synchronously.
 	if ui.ssh.GetStatus(fwd.ID) == "running" {
 		ui.ssh.Disconnect(fwd.ID)
-		return true
+		return
 	}
 
-	// Check if port is already in use
-	inUse, processInfo, err := CheckPortInUse(fwd.LocalPort)
-	if err != nil {
-		fmt.Println("Port check error:", err)
-		ui.setTestResult("端口检查失败", false)
-		return false
-	}
+	// Show "connecting" immediately so the user gets feedback while
+	// the port check + SSH start happen in the background.
+	ui.setTestResult("连接中...", true)
 
-	if inUse {
-		// Show port conflict dialog
-		ui.showPortConflictDialog = true
-		ui.portConflictPort = fwd.LocalPort
-		ui.portConflictProcess = processInfo
-		ui.newPortEntry.SetText(strconv.Itoa(fwd.LocalPort))
-		return false
-	}
+	go func() {
+		inUse, processInfo, err := CheckPortInUse(fwd.LocalPort)
+		if err != nil {
+			fmt.Println("Port check error:", err)
+			ui.setTestResult("端口检查失败", false)
+			return
+		}
 
-	// Port is available, connect
-	if err := ui.ssh.Connect(fwd); err != nil {
-		fmt.Println("Connect error:", err)
-		ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
-	}
-	return true
+		if inUse {
+			// Show port conflict dialog
+			ui.showPortConflictDialog = true
+			ui.portConflictPort = fwd.LocalPort
+			ui.portConflictProcess = processInfo
+			ui.newPortEntry.SetText(strconv.Itoa(fwd.LocalPort))
+			return
+		}
+
+		// Port is available, connect
+		if err := ui.ssh.Connect(fwd); err != nil {
+			fmt.Println("Connect error:", err)
+			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+		}
+	}()
 }
 
 func (ui *UI) toggleConnection() {
@@ -355,11 +362,14 @@ func (ui *UI) handleKillProcess() {
 	ui.setTestResult("进程已结束，正在连接...", true)
 	ui.showPortConflictDialog = false
 
-	// Try to connect
-	if err := ui.ssh.Connect(fwd); err != nil {
-		Logf("UI.handleKillProcess: connect failed after kill: %v", err)
-		ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
-	}
+	// Try to connect asynchronously so the UI does not freeze during
+	// DNS resolution / SSH start.
+	go func() {
+		if err := ui.ssh.Connect(fwd); err != nil {
+			Logf("UI.handleKillProcess: connect failed after kill: %v", err)
+			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+		}
+	}()
 }
 
 // handleChangePort changes the local port to the user-specified value and attempts to connect.
@@ -391,10 +401,12 @@ func (ui *UI) handleChangePort() {
 	ui.setTestResult(fmt.Sprintf("端口已更改为 %d，正在连接...", newPort), true)
 	ui.showPortConflictDialog = false
 
-	// Try to connect with new port
-	if err := ui.ssh.Connect(fwd); err != nil {
-		ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
-	}
+	// Try to connect with new port asynchronously.
+	go func() {
+		if err := ui.ssh.Connect(fwd); err != nil {
+			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+		}
+	}()
 }
 
 // handleIgnoreConflict closes the dialog and attempts to connect anyway.

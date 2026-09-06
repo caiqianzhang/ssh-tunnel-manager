@@ -109,7 +109,9 @@ func ResolveHost(host string) ([]string, error) {
 // Uses a short timeout so the check is fast when the port is free.
 func CheckPortInUse(port int) (bool, string, error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 30*time.Millisecond)
+	// 150ms is long enough to avoid false negatives on loaded systems
+	// but short enough to keep the UI responsive.
+	conn, err := net.DialTimeout("tcp", addr, 150*time.Millisecond)
 	if err != nil {
 		// Port is available (connection refused / timeout).
 		return false, "", nil
@@ -311,17 +313,22 @@ func buildSSHCommand(cfg ForwardConfig) *exec.Cmd {
 	return exec.Command("ssh", args...)
 }
 
-// Connect starts an SSH tunnel with the given configuration
+// Connect starts an SSH tunnel with the given configuration.
+//
+// DNS resolution happens outside the manager lock so a slow resolver
+// cannot block other connections or status queries. The connection is
+// reported as "connecting" immediately; monitorProcess transitions it
+// to "running" once the SSH handshake has had time to complete.
 func (m *SSHManager) Connect(cfg ForwardConfig) error {
+	// Check if already connected (short critical section).
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if already connected
 	if _, exists := m.conns[cfg.ID]; exists {
+		m.mu.Unlock()
 		return fmt.Errorf("connection %s already exists", cfg.ID)
 	}
+	m.mu.Unlock()
 
-	// Resolve host to get IP
+	// Resolve host outside the lock.
 	ips, err := ResolveHost(cfg.RemoteHost)
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %v", err)
@@ -351,9 +358,13 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	}
 
 	// Store connection
+	m.mu.Lock()
 	m.conns[cfg.ID] = sshConn
-	sshConn.Status = "running"
-	m.notifyStatus(cfg.ID, "running")
+	m.mu.Unlock()
+
+	// Report "connecting" — monitorProcess will flip this to "running"
+	// once the tunnel has had time to establish.
+	m.notifyStatus(cfg.ID, "connecting")
 
 	Logf("SSH tunnel started: %s (%s) -> %s:%d via %s (IP: %s)",
 		cfg.Name, cfg.ForwardType, cfg.RemoteHost, cfg.RemotePort, cfg.SSHUser, ips[0])
@@ -364,7 +375,12 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	return nil
 }
 
-// monitorProcess monitors an SSH process and handles auto-reconnect
+// monitorProcess monitors an SSH process and handles auto-reconnect.
+//
+// The process goes through a confirmation window after Start(): if it
+// survives long enough the SSH handshake has completed and the tunnel
+// is active, so we transition "connecting" -> "running". If it exits
+// during the window the failure is reported immediately.
 func (m *SSHManager) monitorProcess(id string) {
 	// Take a snapshot under lock
 	m.mu.RLock()
@@ -375,8 +391,37 @@ func (m *SSHManager) monitorProcess(id string) {
 		return
 	}
 
-	// Wait for the process to exit (without holding any lock)
-	err := sshConn.Process.Wait()
+	// Wait for the process to exit. We use a goroutine + channel so we
+	// can race the exit against a confirmation timeout.
+	exited := make(chan error, 1)
+	go func() {
+		exited <- sshConn.Process.Wait()
+	}()
+
+	// Confirmation window: give the SSH handshake time to complete.
+	// If the process is still alive after this, the tunnel is up.
+	const confirmWindow = 1500 * time.Millisecond
+	select {
+	case <-sshConn.StopCh:
+		// Disconnect was called during the window.
+		<-exited // consume the Wait goroutine to avoid a leak
+		return
+	case err := <-exited:
+		// Process exited during the confirmation window.
+		m.handleProcessExit(id, err, sshConn)
+		return
+	case <-time.After(confirmWindow):
+		// Process survived the window — mark as running.
+		m.mu.Lock()
+		if _, stillExists := m.conns[id]; stillExists {
+			sshConn.Status = "running"
+			m.notifyStatus(id, "running")
+		}
+		m.mu.Unlock()
+	}
+
+	// Process is confirmed running; now wait for it to actually exit.
+	err := <-exited
 
 	// Check if we should stop monitoring
 	select {
@@ -393,6 +438,12 @@ func (m *SSHManager) monitorProcess(id string) {
 	}
 
 	// Process exited
+	m.handleProcessExit(id, err, sshConn)
+}
+
+// handleProcessExit classifies the exit error, updates status, and
+// triggers auto-reconnect when appropriate. Caller must hold m.mu.
+func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 	if err != nil {
 		Logf("SSH process for %s exited with error: %v", id, err)
 	} else {
@@ -488,13 +539,15 @@ func (m *SSHManager) autoReconnect(id string) {
 		sshConn.Stderr.Reset()
 		cmd.Stderr = &sshConn.Stderr
 
-		// Update connection
-		m.mu.Lock()
-		sshConn.Process = cmd
-		sshConn.Status = "connecting"
-		m.notifyStatus(id, "connecting")
-		sshConn.CurrentIP = ips[0]
-		m.mu.Unlock()
+		// Check StopCh before doing anything that starts a process: if
+		// the user disconnected while we were sleeping/resolving, do not
+		// spawn an orphan tunnel.
+		select {
+		case <-sshConn.StopCh:
+			Logf("autoReconnect: StopCh signaled before start, aborting for %s", id)
+			return
+		default:
+		}
 
 		// Start SSH process
 		if err := cmd.Start(); err != nil {
@@ -502,9 +555,12 @@ func (m *SSHManager) autoReconnect(id string) {
 			continue
 		}
 
+		// Start succeeded — publish the new process and status.
 		m.mu.Lock()
-		sshConn.Status = "running"
-		m.notifyStatus(id, "running")
+		sshConn.Process = cmd
+		sshConn.Status = "connecting"
+		m.notifyStatus(id, "connecting")
+		sshConn.CurrentIP = ips[0]
 		m.mu.Unlock()
 
 		Logf("SSH tunnel reconnected: %s -> %s:%d via %s (IP: %s)",
@@ -627,8 +683,10 @@ func (m *SSHManager) GetActiveConnections() []string {
 	return ids
 }
 
-// FormatSSHCommand returns the SSH command that would be executed for a given config
-// Useful for debugging and testing
+// FormatSSHCommand returns the SSH command that would be executed for a given config.
+// Useful for debugging and testing. NOTE: the returned string omits the
+// sshpass wrapper and password argument — it shows the underlying ssh
+// invocation only, so it never leaks credentials into logs or test output.
 func FormatSSHCommand(cfg ForwardConfig) string {
 	forwardFlag := "-L"
 	if cfg.ForwardType == "remote" {

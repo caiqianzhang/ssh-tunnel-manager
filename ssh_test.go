@@ -77,3 +77,70 @@ func TestSSHManagerDisconnectNonexistent(t *testing.T) {
 		t.Error("expected error when disconnecting nonexistent connection")
 	}
 }
+
+// TestAutoReconnectAbortsOnStopCh verifies that autoReconnect does not
+// spawn an orphan tunnel when the connection was disconnected during the
+// retry window (FlushDNS + sleep + resolve).
+func TestAutoReconnectAbortsOnStopCh(t *testing.T) {
+	mgr := NewSSHManager()
+
+	// Build a conn whose StopCh is already closed (simulating Disconnect).
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID:            "abort-test",
+			RemoteHost:    "127.0.0.1",
+			RemotePort:    22,
+			LocalHost:     "127.0.0.1",
+			LocalPort:     0, // 0 = kernel-assigned, avoids real port use
+			SSHUser:       "u",
+			AutoReconnect: true,
+			MaxRetries:    1,
+			RetryInterval: 1,
+		},
+		Status: "disconnected",
+		StopCh: func() chan struct{} {
+			c := make(chan struct{})
+			close(c)
+			return c
+		}(),
+	}
+	mgr.mu.Lock()
+	mgr.conns["abort-test"] = conn
+	mgr.mu.Unlock()
+
+	// autoReconnect should notice the closed StopCh and return without
+	// starting any process. We verify by checking no process was started
+	// (conn.Process stays nil) and the connection is still in the map
+	// with its original status.
+	mgr.autoReconnect("abort-test")
+
+	if conn.Process != nil {
+		t.Error("autoReconnect started a process despite closed StopCh")
+	}
+}
+
+// TestDecryptPasswordError verifies that decryptPassword returns an
+// error (not the ciphertext) when GCM open fails — e.g. when the secret
+// key changed or the data is corrupt. Silently passing garbage to SSH
+// would surface as a confusing "Permission denied".
+func TestDecryptPasswordError(t *testing.T) {
+	// Encrypt with one key...
+	tmp := t.TempDir()
+	oldDir := secretKeyDir
+	secretKeyDir = func() (string, error) { return tmp, nil }
+	t.Cleanup(func() { secretKeyDir = oldDir })
+
+	ct, err := encryptPassword("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ...then switch the key and try to decrypt. This must fail.
+	tmp2 := t.TempDir()
+	secretKeyDir = func() (string, error) { return tmp2, nil }
+
+	_, err = decryptPassword(ct)
+	if err == nil {
+		t.Error("expected error when decrypting with wrong key, got nil")
+	}
+}

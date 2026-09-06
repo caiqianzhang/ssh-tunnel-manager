@@ -83,7 +83,16 @@ func secretKeyFile() (string, error) {
 }
 
 // migrateFile copies src to dst when src exists and dst does not.
+// src is resolved relative to the executable's directory so the
+// migration works regardless of the user's current working directory.
 func migrateFile(src, dst string) {
+	exe, err := os.Executable()
+	if err != nil {
+		Logf("migrate: cannot resolve executable path: %v", err)
+		return
+	}
+	src = filepath.Join(filepath.Dir(exe), src)
+
 	in, err := os.Open(src)
 	if err != nil {
 		return // nothing to migrate

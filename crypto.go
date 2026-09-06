@@ -119,8 +119,11 @@ func decryptPassword(cipherText string) (string, error) {
 	ct := raw[gcm.NonceSize():]
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
-		// Likely legacy plaintext.
-		return cipherText, nil
+		// Decryption failed — likely because the secret key changed
+		// or the ciphertext is corrupt. Return an error instead of
+		// silently passing garbage to SSH (which would surface as a
+		// confusing "Permission denied").
+		return "", fmt.Errorf("decrypt password: GCM open failed (wrong key or corrupt data): %w", err)
 	}
 	return string(pt), nil
 }
