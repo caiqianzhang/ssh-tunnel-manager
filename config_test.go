@@ -293,3 +293,63 @@ func TestConfigLoadsLegacyPlaintextPassword(t *testing.T) {
 		t.Errorf("legacy plaintext not preserved: got %q want %q", got.SSHPassword, secret)
 	}
 }
+
+// TestConfigEncryptsAPIKeyOnDisk verifies the API key is encrypted on
+// disk (like SSH passwords) and round-trips through Save/Load. The
+// API key is a live credential and was previously stored in plaintext
+// alongside the config.
+func TestConfigEncryptsAPIKeyOnDisk(t *testing.T) {
+	tmp := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmp)
+	defer os.Chdir(oldWd)
+
+	const apiKey = "sk-ant-live-key-123"
+	cfgFile := filepath.Join(tmp, "test_apikey.json")
+	cm := NewConfigManager(cfgFile)
+	cm.SetAPIKey(apiKey)
+	if err := cm.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), apiKey) {
+		t.Errorf("config file contains plaintext API key:\n%s", string(raw))
+	}
+
+	// Round-trip: Load must decrypt back to the original value.
+	cm2 := NewConfigManager(cfgFile)
+	if err := cm2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cm2.GetAPIKey(); got != apiKey {
+		t.Errorf("API key round-trip failed: got %q want %q", got, apiKey)
+	}
+}
+
+// TestConfigLoadsLegacyPlaintextAPIKey verifies a pre-encryption API
+// key (raw plaintext in the JSON) still loads without error.
+func TestConfigLoadsLegacyPlaintextAPIKey(t *testing.T) {
+	tmp := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmp)
+	defer os.Chdir(oldWd)
+
+	const apiKey = "legacy-plain-key"
+	cfgFile := filepath.Join(tmp, "test_legacy_key.json")
+	legacy := `{"forwards":[],"settings":{"api_key":"` + apiKey + `"}}`
+	if err := os.WriteFile(cfgFile, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager(cfgFile)
+	if err := cm.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cm.GetAPIKey(); got != apiKey {
+		t.Errorf("legacy plaintext API key not preserved: got %q want %q", got, apiKey)
+	}
+}

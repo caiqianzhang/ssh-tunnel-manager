@@ -2,7 +2,10 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,12 +229,13 @@ func TestLoadConfigToForm(t *testing.T) {
 	cfg.DeleteForward("test-load")
 }
 
-// TestSSHFowardingCommand tests SSH command generation (unchanged).
+// TestSSHFowardingCommand tests SSH command generation.
 func TestSSHFowardingCommand(t *testing.T) {
 	tests := []struct {
 		name     string
 		cfg      ForwardConfig
-		expected string
+		contains []string
+		notHave  []string
 	}{
 		{
 			"local forwarding",
@@ -243,7 +247,17 @@ func TestSSHFowardingCommand(t *testing.T) {
 				LocalPort:   2222,
 				SSHUser:     "you",
 			},
-			"ssh -L 2222:127.0.0.1:15721 -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -l you 192.168.1.33",
+			[]string{
+				"ssh -L 2222:127.0.0.1:15721",
+				"-N",
+				"-o ServerAliveInterval=60",
+				"-o ServerAliveCountMax=3",
+				"-o ExitOnForwardFailure=yes",
+				"-o StrictHostKeyChecking=accept-new",
+				"-o UserKnownHostsFile=",
+				"-l you 192.168.1.33",
+			},
+			[]string{"StrictHostKeyChecking=no"},
 		},
 		{
 			"remote forwarding",
@@ -255,15 +269,32 @@ func TestSSHFowardingCommand(t *testing.T) {
 				LocalPort:   80,
 				SSHUser:     "admin",
 			},
-			"ssh -R 80:localhost:8080 -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -l admin example.com",
+			[]string{
+				"ssh -R 80:localhost:8080",
+				"-N",
+				"-o ServerAliveInterval=60",
+				"-o ServerAliveCountMax=3",
+				"-o ExitOnForwardFailure=yes",
+				"-o StrictHostKeyChecking=accept-new",
+				"-o UserKnownHostsFile=",
+				"-l admin example.com",
+			},
+			[]string{"StrictHostKeyChecking=no"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := FormatSSHCommand(tt.cfg)
-			if cmd != tt.expected {
-				t.Errorf("expected:\n%s\ngot:\n%s", tt.expected, cmd)
+			for _, want := range tt.contains {
+				if !strings.Contains(cmd, want) {
+					t.Errorf("expected command to contain %q, got:\n%s", want, cmd)
+				}
+			}
+			for _, forbidden := range tt.notHave {
+				if strings.Contains(cmd, forbidden) {
+					t.Errorf("expected command NOT to contain %q, got:\n%s", forbidden, cmd)
+				}
 			}
 		})
 	}
@@ -327,6 +358,12 @@ func TestSaveSettingsPreservesMaxRetriesAndInterval(t *testing.T) {
 // saveSettings must surface the error to the user via setTestResult
 // rather than silently switching back to the main page.
 func TestSaveSettingsReportsFailure(t *testing.T) {
+	// Root bypasses filesystem permission bits, so the read-only-dir
+	// trick this test relies on cannot make the config unwritable.
+	if os.Getuid() == 0 {
+		t.Skip("skipped as root: chmod does not restrict writes")
+	}
+
 	tmpDir := t.TempDir()
 	oldWd, _ := os.Getwd()
 	os.Chdir(tmpDir)
@@ -451,4 +488,155 @@ func TestUIEventLoop(t *testing.T) {
 	}()
 
 	time.Sleep(100 * time.Millisecond)
+}
+
+// Regression test for the stale-connection bug: handleProcessExit
+// classifies a tunnel failure and sets a terminal status but never
+// removes the connection from the map. Without cleanup, the next
+// "连接" click reaches ssh.Connect, which returns
+// "connection already exists" — a permanent, unrecoverable error
+// until the app is restarted.
+//
+// checkPortAndConnect must therefore clean up a stale (non-running,
+// tracked) connection before attempting to connect.
+func TestCheckPortAndConnectCleansUpStaleConn(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	cm := NewConfigManager(filepath.Join(tmpDir, "stale.json"))
+	cm.AddForward(ForwardConfig{
+		ID: "stale-1", Name: "default", ForwardType: "local",
+		RemoteHost: "this-host-does-not-exist.invalid",
+		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
+		SSHUser: "u",
+	})
+	sshMgr := NewSSHManager()
+	ui := NewUI(cm, sshMgr)
+
+	// Seed a stale connection in the failed state that handleProcessExit
+	// would have left behind.
+	stale := &SSHConn{
+		Config: ForwardConfig{
+			ID: "stale-1", Name: "default", ForwardType: "local",
+			RemoteHost: "this-host-does-not-exist.invalid",
+			RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
+			SSHUser: "u",
+		},
+		Status:  "auth_failed",
+		StopCh:  make(chan struct{}),
+		Process: exec.Command("true"),
+	}
+	sshMgr.mu.Lock()
+	sshMgr.conns["stale-1"] = stale
+	sshMgr.mu.Unlock()
+
+	// Deterministic port check: port is free, so we proceed to connect.
+	ui.portChecker = func(port int) (bool, string, error) { return false, "", nil }
+
+	fwd := cm.GetForwards()[0]
+	ui.checkPortAndConnect(fwd)
+
+	// The stale conn must have been cleaned up synchronously before the
+	// background connect was launched.
+	if status := sshMgr.GetStatus("stale-1"); status != "not_found" {
+		t.Errorf("expected stale conn to be cleaned up, got status %q", status)
+	}
+
+	// Wait for the background connect to finish (it will fail at DNS
+	// resolution, but it must NOT be the "already exists" error).
+	done := make(chan struct{})
+	go func() {
+		for {
+			ui.testMu.Lock()
+			r := ui.testResult
+			ui.testMu.Unlock()
+			if r != "" {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect did not report a result in time")
+	}
+
+	ui.testMu.Lock()
+	result := ui.testResult
+	ui.testMu.Unlock()
+	if strings.Contains(result, "already exists") {
+		t.Errorf("stale conn was not cleaned up before connect; got %q", result)
+	}
+	if result == "" {
+		t.Error("expected a non-empty connect result")
+	}
+}
+
+// Regression test: the port-conflict dialog state must never be touched
+// from a background goroutine. ShowPortConflictForAutoConnect and the
+// connect path queue their mutations for the UI thread; only drainUICmds
+// (run on the event loop) may apply them. Under -race, the previous
+// direct-write implementation flags a data race between worker goroutines
+// and the render thread reading the same fields.
+func TestConflictDialogStateIsQueuedNotTouched(t *testing.T) {
+	cfg := NewConfigManager("test_config.json")
+	sshMgr := NewSSHManager()
+	ui := NewUI(cfg, sshMgr)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Concurrent writers from background goroutines.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				ui.ShowPortConflictForAutoConnect(2000+id, "some-process")
+			}
+		}(i)
+	}
+
+	// Concurrent reader on another goroutine, racing the writers. It is
+	// part of wg so wg.Wait() below also guarantees it has stopped before
+	// we drain — otherwise the drain would race the reader's reads.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = ui.showPortConflictDialog
+			_ = ui.portConflictPort
+			_ = ui.portConflictProcess
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Drain on the UI thread and verify the state is consistent.
+	ui.drainUICmds()
+	if !ui.showPortConflictDialog {
+		t.Error("expected dialog to be shown after draining the queue")
+	}
+	if ui.portConflictProcess != "some-process" {
+		t.Errorf("unexpected process %q", ui.portConflictProcess)
+	}
+	if ui.portConflictPort < 2000 || ui.portConflictPort > 2003 {
+		t.Errorf("unexpected port %d", ui.portConflictPort)
+	}
 }

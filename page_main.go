@@ -205,6 +205,13 @@ func (ui *UI) renderHeroStatus(gtx layout.Context) layout.Dimensions {
 // ─── Action row: connect + test buttons ──────────────────────
 
 func (ui *UI) renderActionRow(gtx layout.Context) layout.Dimensions {
+	// ui.testing is written by testAPI under testMu; snapshot it here
+	// so the render thread never reads it without the lock (would race
+	// with testAPI's writes).
+	ui.testMu.Lock()
+	testing := ui.testing
+	ui.testMu.Unlock()
+
 	return layout.Flex{Axis: layout.Horizontal, Spacing: 8}.Layout(gtx,
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 			return ui.toggleBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -227,7 +234,7 @@ func (ui *UI) renderActionRow(gtx layout.Context) layout.Dimensions {
 			})
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return ui.ghostBtn(gtx, &ui.testBtn, "测试", ui.testing)
+			return ui.ghostBtn(gtx, &ui.testBtn, "测试", testing)
 		}),
 	)
 }

@@ -136,7 +136,17 @@ func main() {
 				}
 				return
 			}
-			sshMgr.Connect(fwd)
+			if err := sshMgr.Connect(fwd); err != nil {
+				Logf("trayConnect: connect failed: %v", err)
+				// Surface the failure to the user instead of silently
+				// dropping it — a failed tray "连接" click left the
+				// user staring at a gray "未连接" with no idea why.
+				if u := currentUI(); u != nil {
+					u.queueUIFunc(func() {
+						u.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+					})
+				}
+			}
 		}()
 	}
 
@@ -200,6 +210,13 @@ func runAppLoop(showReq, quitCh chan struct{}, cfg *ConfigManager, sshMgr *SSHMa
 
 			winMu.Lock()
 			winAlive = false
+			// The OS window state (maximized or not) is lost when
+			// the window is destroyed, but ui.maximized still
+			// reflects the last title-bar toggle. Reset it so the
+			// restored window's max button shows the correct icon.
+			if ui != nil {
+				ui.maximized = false
+			}
 			winMu.Unlock()
 
 			Log("runAppLoop: window closed, waiting in system tray")
@@ -251,6 +268,11 @@ func autoConnect(cfg *ConfigManager, sshMgr *SSHManager, ui *UI) {
 	// Port is available, connect
 	if err := sshMgr.Connect(fwd); err != nil {
 		Logf("autoConnect: connect error: %v", err)
+		// Surface the failure to the user rather than logging it and
+		// leaving them with a gray "未连接" and no explanation.
+		ui.queueUIFunc(func() {
+			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+		})
 	} else {
 		Logf("autoConnect: successfully started SSH tunnel for '%s'", fwd.Name)
 	}

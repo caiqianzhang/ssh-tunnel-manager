@@ -98,6 +98,45 @@ type UI struct {
 	// Hero status, recomputed each frame by updateHeroStatus.
 	heroDotColor   color.NRGBA
 	heroStatusText string
+
+	// portChecker overrides CheckPortInUse for tests; nil means use it.
+	portChecker func(port int) (bool, string, error)
+
+	// uiCmdQ carries UI mutations queued by background goroutines. The
+	// event loop drains them on the UI thread (see drainUICmds) so
+	// widget state — editors, clickables, dialog fields — is never
+	// touched from a worker goroutine, which would race with the
+	// render thread. Gio renders from a single thread; all UI state
+	// changes must happen there.
+	uiCmdQ  []uiCmd
+	uiCmdMu sync.Mutex
+}
+
+// uiCmd is a closure queued by background work and run on the UI
+// event thread. It lets worker goroutines request UI changes without
+// touching widget state directly (which would be a data race).
+type uiCmd func()
+
+// queueUIFunc appends f to the pending UI-command queue. Safe to call
+// from any goroutine; the event loop drains the queue on the UI thread
+// via drainUICmds.
+func (ui *UI) queueUIFunc(f uiCmd) {
+	ui.uiCmdMu.Lock()
+	ui.uiCmdQ = append(ui.uiCmdQ, f)
+	ui.uiCmdMu.Unlock()
+}
+
+// drainUICmds runs every pending UI command on the current (UI) thread.
+// Call it at the start of handleEvents so queued mutations are applied
+// before this frame's events and layout.
+func (ui *UI) drainUICmds() {
+	ui.uiCmdMu.Lock()
+	cmds := ui.uiCmdQ
+	ui.uiCmdQ = nil
+	ui.uiCmdMu.Unlock()
+	for _, f := range cmds {
+		f()
+	}
 }
 
 // AttachWindow binds the UI to a (re)created app window. The window is
@@ -134,6 +173,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.forwardLocal.Value = true
 	u.autoReconnect.Value = true
 	u.localHostEntry.SetText("localhost")
+	u.portChecker = CheckPortInUse
 
 	// Initialize settings list for scrolling
 	u.settingsList.Axis = layout.Vertical
@@ -187,6 +227,10 @@ func (ui *UI) Layout(gtx layout.Context) layout.Dimensions {
 // ═══════════════════════════════════════════════════════════════
 
 func (ui *UI) handleEvents(gtx layout.Context) {
+	// Apply any UI mutations queued by background goroutines on the UI
+	// thread before processing this frame's events.
+	ui.drainUICmds()
+
 	// Custom title bar window controls.
 	if ui.win != nil {
 		if _, ok := ui.minBtn.Update(gtx); ok {
@@ -218,6 +262,12 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	ui.apiKeyEntry.Update(gtx)
 	ui.newPortEntry.Update(gtx)
 
+	// Snapshot testing under the lock: testAPI writes it from a
+	// goroutine, so reading it here without the lock would race.
+	ui.testMu.Lock()
+	testing := ui.testing
+	ui.testMu.Unlock()
+
 	// Paste is handled entirely by widget.Editor itself (Ctrl+V issues
 	// clipboard.ReadCmd and the editor consumes the DataEvent for its
 	// own tag). Per-field paste buttons were removed as redundant.
@@ -243,7 +293,13 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 		ui.toggleConnection()
 	}
 	if _, ok := ui.testBtn.Update(gtx); ok {
-		go ui.testAPI()
+		// Ignore repeat clicks while a test is already running: the
+		// ghostBtn only grays out the label, it does not stop the
+		// widget from delivering clicks, so without this guard a
+		// rapid double-click spawns two concurrent testAPI calls.
+		if !testing {
+			go ui.testAPI()
+		}
 	}
 	if _, ok := ui.saveBtn.Update(gtx); ok {
 		ui.saveSettings()
@@ -251,12 +307,15 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 
 	// Handle port conflict dialog buttons. Bug 22: ignore repeat clicks
 	// while a handler is running, so we don't double-kill or spawn two
-	// SSH processes.
+	// SSH processes. conflictBusy is held until the handler's async
+	// connect finishes (the handler queues its own release via
+	// queueUIFunc), so it covers the whole critical section.
 	if ui.showPortConflictDialog && !ui.conflictBusy {
 		if _, ok := ui.killProcessBtn.Update(gtx); ok {
+			// conflictBusy stays true until handleKillProcess's async
+			// connect completes (it queues conflictBusy=false itself).
 			ui.conflictBusy = true
 			ui.handleKillProcess()
-			ui.conflictBusy = false
 		}
 		if _, ok := ui.changePortBtn.Update(gtx); ok {
 			if !ui.showNewPortEntry {
@@ -264,9 +323,11 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 				ui.showNewPortEntry = true
 				return
 			}
+			// Second press: change the port and connect. conflictBusy
+			// stays true until handleChangePort's async connect
+			// completes (it queues conflictBusy=false itself).
 			ui.conflictBusy = true
 			ui.handleChangePort()
-			ui.conflictBusy = false
 		}
 		if _, ok := ui.overlayBtn.Update(gtx); ok {
 			ui.dismissConflictDialog()
@@ -280,9 +341,20 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 // later via setTestResult / showPortConflictDialog.
 func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 	// Fast path: already running — disconnect synchronously.
-	if ui.ssh.GetStatus(fwd.ID) == "running" {
+	status := ui.ssh.GetStatus(fwd.ID)
+	if status == "running" {
 		ui.ssh.Disconnect(fwd.ID)
 		return
+	}
+
+	// If a previous connection is still tracked (failed, disconnected,
+	// mid-handshake, etc.) clean it up first. handleProcessExit never
+	// removes the conn from the map — it only sets a terminal status —
+	// so without this the user gets a permanent
+	// "connection already exists" after any tunnel failure, and can
+	// only recover by restarting the app.
+	if status != "not_found" {
+		ui.ssh.Disconnect(fwd.ID)
 	}
 
 	// Show "connecting" immediately so the user gets feedback while
@@ -290,7 +362,7 @@ func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 	ui.setTestResult("连接中...", true)
 
 	go func() {
-		inUse, processInfo, err := CheckPortInUse(fwd.LocalPort)
+		inUse, processInfo, err := ui.portChecker(fwd.LocalPort)
 		if err != nil {
 			fmt.Println("Port check error:", err)
 			ui.setTestResult("端口检查失败", false)
@@ -298,11 +370,12 @@ func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 		}
 
 		if inUse {
-			// Show port conflict dialog
-			ui.showPortConflictDialog = true
-			ui.portConflictPort = fwd.LocalPort
-			ui.portConflictProcess = processInfo
-			ui.newPortEntry.SetText(strconv.Itoa(fwd.LocalPort))
+			// Show port conflict dialog. Queue it for the UI thread:
+			// setting widget.Editor state from a worker goroutine
+			// would race with the render loop.
+			ui.queueUIFunc(func() {
+				ui.showConflictDialogInternal(fwd.LocalPort, processInfo, false)
+			})
 			return
 		}
 
@@ -326,16 +399,26 @@ func (ui *UI) toggleConnection() {
 	ui.checkPortAndConnect(fwd)
 }
 
-// ShowPortConflictForAutoConnect shows the port conflict dialog for auto-connect scenarios.
-// This can be called from a goroutine (e.g., autoConnect at startup).
+// ShowPortConflictForAutoConnect schedules the port conflict dialog to
+// be shown. It may be called from a goroutine (e.g. autoConnect at
+// startup); the actual dialog state is applied on the UI thread via
+// queueUIFunc so widget state is never touched from a worker goroutine.
 func (ui *UI) ShowPortConflictForAutoConnect(port int, processInfo string) {
-	ui.showNewPortEntry = false
 	Logf("UI.ShowPortConflictForAutoConnect: port=%d, process=%s", port, processInfo)
+	ui.queueUIFunc(func() {
+		ui.showConflictDialogInternal(port, processInfo, false)
+	})
+	Log("UI.ShowPortConflictForAutoConnect: dialog state queued")
+}
+
+// showConflictDialogInternal sets the port-conflict dialog state. It must
+// run on the UI thread because it touches widget.Editor state.
+func (ui *UI) showConflictDialogInternal(port int, process string, showNewPort bool) {
 	ui.showPortConflictDialog = true
+	ui.showNewPortEntry = showNewPort
 	ui.portConflictPort = port
-	ui.portConflictProcess = processInfo
+	ui.portConflictProcess = process
 	ui.newPortEntry.SetText(strconv.Itoa(port))
-	Log("UI.ShowPortConflictForAutoConnect: dialog state set to true")
 }
 
 // handleKillProcess kills the process using the conflicting port and then attempts to connect.
@@ -345,6 +428,7 @@ func (ui *UI) handleKillProcess() {
 	if len(forwards) == 0 {
 		Log("UI.handleKillProcess: no forwards configured")
 		ui.showPortConflictDialog = false
+		ui.conflictBusy = false
 		return
 	}
 	fwd := forwards[0]
@@ -355,6 +439,7 @@ func (ui *UI) handleKillProcess() {
 		Logf("UI.handleKillProcess: kill failed: %v", err)
 		ui.setTestResult(fmt.Sprintf("结束进程失败: %v", err), false)
 		ui.showPortConflictDialog = false
+		ui.conflictBusy = false
 		return
 	}
 
@@ -363,12 +448,15 @@ func (ui *UI) handleKillProcess() {
 	ui.showPortConflictDialog = false
 
 	// Try to connect asynchronously so the UI does not freeze during
-	// DNS resolution / SSH start.
+	// DNS resolution / SSH start. conflictBusy stays true until the
+	// connect finishes so repeat clicks cannot spawn a second tunnel;
+	// the release is queued for the UI thread via queueUIFunc.
 	go func() {
 		if err := ui.ssh.Connect(fwd); err != nil {
 			Logf("UI.handleKillProcess: connect failed after kill: %v", err)
-			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+			ui.queueUIFunc(func() { ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false) })
 		}
+		ui.queueUIFunc(func() { ui.conflictBusy = false })
 	}()
 }
 
@@ -377,6 +465,7 @@ func (ui *UI) handleChangePort() {
 	forwards := ui.config.GetForwards()
 	if len(forwards) == 0 {
 		ui.showPortConflictDialog = false
+		ui.conflictBusy = false
 		return
 	}
 	fwd := forwards[0]
@@ -386,6 +475,7 @@ func (ui *UI) handleChangePort() {
 	newPort, err := strconv.Atoi(newPortStr)
 	if err != nil || newPort < 1 || newPort > 65535 {
 		ui.setTestResult("无效的端口号", false)
+		ui.conflictBusy = false
 		return
 	}
 
@@ -395,24 +485,27 @@ func (ui *UI) handleChangePort() {
 	if err := ui.config.Save(); err != nil {
 		ui.setTestResult(fmt.Sprintf("保存配置失败: %v", err), false)
 		ui.showPortConflictDialog = false
+		ui.conflictBusy = false
 		return
 	}
 
 	ui.setTestResult(fmt.Sprintf("端口已更改为 %d，正在连接...", newPort), true)
 	ui.showPortConflictDialog = false
 
-	// Try to connect with new port asynchronously.
+	// Try to connect with new port asynchronously. conflictBusy stays
+	// true until the connect finishes so repeat clicks cannot spawn a
+	// second tunnel; the release is queued for the UI thread.
 	go func() {
 		if err := ui.ssh.Connect(fwd); err != nil {
-			ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false)
+			ui.queueUIFunc(func() { ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false) })
 		}
+		ui.queueUIFunc(func() { ui.conflictBusy = false })
 	}()
 }
 
-// handleIgnoreConflict closes the dialog and attempts to connect anyway.
-// dismissConflictDialog closes the dialog without attempting to
-// connect. To retry the connection afterwards, press 连接 on the main
-// page (it re-runs the conflict check first).
+// dismissConflictDialog closes the port-conflict dialog without
+// taking any action. To retry the connection afterwards, press 连接
+// on the main page (it re-runs the conflict check first).
 func (ui *UI) dismissConflictDialog() {
 	ui.showPortConflictDialog = false
 	ui.showNewPortEntry = false

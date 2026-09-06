@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -121,6 +123,11 @@ func CheckPortInUse(port int) (bool, string, error) {
 	// Port is in use, try to find the process.
 	out, err := exec.Command("ss", "-tlnp", fmt.Sprintf("sport = :%d", port)).Output()
 	if err != nil {
+		// Don't silently swallow the ss error — it usually means
+		// ss is missing or the port is held by a process we can't
+		// inspect (e.g. a kernel socket). Log it so the failure is
+		// diagnosable.
+		Logf("CheckPortInUse: ss failed for port %d: %v", port, err)
 		return true, "unknown process", nil
 	}
 
@@ -296,7 +303,12 @@ func buildSSHCommand(cfg ForwardConfig) *exec.Cmd {
 		"-o", "ServerAliveInterval=60",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ExitOnForwardFailure=yes",
-		"-o", "StrictHostKeyChecking=no",
+		// accept-new accepts hosts not yet in known_hosts but refuses
+		// to replace an existing key — far safer than
+		// StrictHostKeyChecking=no, which disables host verification
+		// entirely and leaves the tunnel open to a MITM downgrade.
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=" + knownHostsPath(),
 	}
 
 	if cfg.SSHPassword != "" {
@@ -307,10 +319,39 @@ func buildSSHCommand(cfg ForwardConfig) *exec.Cmd {
 	args = append(args, "-l", cfg.SSHUser, cfg.RemoteHost)
 
 	if cfg.SSHPassword != "" {
-		args = append([]string{"-p", cfg.SSHPassword, "ssh"}, args...)
+		// Never pass the password on the command line: every local
+		// user can read it via `ps` or /proc/<pid>/cmdline. Instead
+		// feed it to sshpass through file descriptor 3 (see
+		// attachPasswordPipe). sshpass -d 3 reads the password from
+		// that fd and never exposes it in the process title.
+		args = append([]string{"-d", "3", "ssh"}, args...)
 		return exec.Command("sshpass", args...)
 	}
 	return exec.Command("ssh", args...)
+}
+
+// attachPasswordPipe sets up a pipe carrying the SSH password to
+// sshpass via file descriptor 3, so the credential never appears in
+// the process command line (ps, /proc/<pid>/cmdline). Returns the
+// read end, which the caller must close if Start fails; on success
+// Go closes the parent's copy of the ExtraFiles entry after the
+// child starts (see os/exec exec.go: closeDescriptors).
+func attachPasswordPipe(cmd *exec.Cmd, password string) (*os.File, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create password pipe: %w", err)
+	}
+	if _, err := io.WriteString(w, password); err != nil {
+		r.Close()
+		w.Close()
+		return nil, fmt.Errorf("write password to pipe: %w", err)
+	}
+	// Close the write end before Start so the child sees EOF after
+	// reading the password. The pipe buffer holds the data until the
+	// child reads it.
+	w.Close()
+	cmd.ExtraFiles = []*os.File{r}
+	return r, nil
 }
 
 // Connect starts an SSH tunnel with the given configuration.
@@ -340,6 +381,17 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 
 	cmd := buildSSHCommand(cfg)
 
+	// If the config carries a password, feed it to sshpass through a
+	// pipe (fd 3) rather than the command line.
+	var pwRead *os.File
+	if cfg.SSHPassword != "" {
+		var err error
+		pwRead, err = attachPasswordPipe(cmd, cfg.SSHPassword)
+		if err != nil {
+			return fmt.Errorf("failed to set up password pipe: %v", err)
+		}
+	}
+
 	// Create SSHConn
 	sshConn := &SSHConn{
 		Config:    cfg,
@@ -354,11 +406,27 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 
 	// Start the SSH process
 	if err := cmd.Start(); err != nil {
+		if pwRead != nil {
+			pwRead.Close()
+		}
 		return fmt.Errorf("failed to start SSH process: %v", err)
 	}
 
-	// Store connection
+	// Store connection. Re-check existence under the lock first: another
+	// Connect for the same ID may have stored while we were resolving the
+	// host and starting the process. Without this check both calls pass
+	// the earlier existence test and the loser's tunnel is orphaned — a
+	// running SSH process with no monitor and no StopCh, which also
+	// fights the winner over the same local port.
 	m.mu.Lock()
+	if _, exists := m.conns[cfg.ID]; exists {
+		m.mu.Unlock()
+		if sshConn.Process != nil && sshConn.Process.Process != nil {
+			_ = sshConn.Process.Process.Kill()
+		}
+		_ = sshConn.Process.Wait()
+		return fmt.Errorf("connection %s already exists", cfg.ID)
+	}
 	m.conns[cfg.ID] = sshConn
 	m.mu.Unlock()
 
@@ -407,7 +475,14 @@ func (m *SSHManager) monitorProcess(id string) {
 		<-exited // consume the Wait goroutine to avoid a leak
 		return
 	case err := <-exited:
-		// Process exited during the confirmation window.
+		// Process exited during the confirmation window. If the user
+		// disconnected while we were waiting, don't classify the exit
+		// or attempt a reconnect.
+		select {
+		case <-sshConn.StopCh:
+			return
+		default:
+		}
 		m.handleProcessExit(id, err, sshConn)
 		return
 	case <-time.After(confirmWindow):
@@ -431,28 +506,39 @@ func (m *SSHManager) monitorProcess(id string) {
 	default:
 	}
 
-	m.mu.Lock()
-	if _, stillExists := m.conns[id]; !stillExists {
-		m.mu.Unlock()
-		return
-	}
-
-	// Process exited
+	// Process exited. handleProcessExit acquires m.mu itself and
+	// checks whether the connection is still tracked before doing
+	// anything, so we do not need to hold the lock here.
 	m.handleProcessExit(id, err, sshConn)
 }
 
 // handleProcessExit classifies the exit error, updates status, and
-// triggers auto-reconnect when appropriate. Caller must hold m.mu.
+// triggers auto-reconnect when appropriate. It acquires m.mu itself;
+// callers must NOT hold it.
 func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// The connection may have been removed (e.g. by Disconnect) while
+	// we were waiting for the process to exit; nothing to do then.
+	if _, ok := m.conns[id]; !ok {
+		return
+	}
+
 	if err != nil {
 		Logf("SSH process for %s exited with error: %v", id, err)
 	} else {
 		Logf("SSH process for %s exited normally", id)
 	}
 
-	// Log stderr output for diagnostics
+	// Log stderr output for diagnostics. Truncate it: full stderr can
+	// contain credentials (password prompts) or other sensitive data,
+	// and it is written to a log file that may be world-readable.
 	stderr := sshConn.Stderr.String()
 	if stderr != "" {
+		if len(stderr) > 200 {
+			stderr = stderr[:200] + "..."
+		}
 		Logf("SSH stderr for %s: %s", id, stderr)
 	}
 
@@ -478,7 +564,6 @@ func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 
 	sshConn.Status = status
 	m.notifyStatus(id, status)
-	m.mu.Unlock()
 
 	// Check if auto-reconnect is enabled
 	if shouldReconnect && sshConn.Config.AutoReconnect {
@@ -539,6 +624,18 @@ func (m *SSHManager) autoReconnect(id string) {
 		sshConn.Stderr.Reset()
 		cmd.Stderr = &sshConn.Stderr
 
+		// Feed the password through a pipe (fd 3) rather than the
+		// command line, same as Connect.
+		var pwRead *os.File
+		if cfg.SSHPassword != "" {
+			var err error
+			pwRead, err = attachPasswordPipe(cmd, cfg.SSHPassword)
+			if err != nil {
+				Logf("autoReconnect: password pipe failed: %v", err)
+				continue
+			}
+		}
+
 		// Check StopCh before doing anything that starts a process: if
 		// the user disconnected while we were sleeping/resolving, do not
 		// spawn an orphan tunnel.
@@ -551,12 +648,29 @@ func (m *SSHManager) autoReconnect(id string) {
 
 		// Start SSH process
 		if err := cmd.Start(); err != nil {
+			if pwRead != nil {
+				pwRead.Close()
+			}
 			Logf("Failed to start SSH process on attempt %d: %v", i+1, err)
 			continue
 		}
 
-		// Start succeeded — publish the new process and status.
+		// Start succeeded — publish the new process and status. Re-check
+		// existence under the lock first: the StopCh check above is not
+		// atomic with this store, so Disconnect may have closed StopCh and
+		// removed the conn while we were starting. Publishing anyway would
+		// re-add an orphan tunnel (or a stuck "connecting" conn with a
+		// dead process) and silently undo the user's disconnect.
 		m.mu.Lock()
+		if _, exists := m.conns[id]; !exists {
+			m.mu.Unlock()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = cmd.Wait()
+			Logf("autoReconnect: conn %s removed during start, aborting", id)
+			return
+		}
 		sshConn.Process = cmd
 		sshConn.Status = "connecting"
 		m.notifyStatus(id, "connecting")
@@ -572,6 +686,16 @@ func (m *SSHManager) autoReconnect(id string) {
 	}
 
 	Logf("Auto-reconnect failed for %s after %d attempts", id, maxRetries)
+
+	// Surface the failure to the UI: notify the status transition so
+	// the render loop repaints with the disconnected state. Without
+	// this the user sees a stale "connecting" or last-known status.
+	m.mu.Lock()
+	if c, ok := m.conns[id]; ok {
+		c.Status = "disconnected"
+		m.notifyStatus(id, "disconnected")
+	}
+	m.mu.Unlock()
 }
 
 // Disconnect stops an SSH connection and releases its resources so they
@@ -610,8 +734,15 @@ func (m *SSHManager) Disconnect(id string) error {
 		sshConn.Process.Stderr = nil
 	}
 
-	// Clear the buffer too (defensive).
-	sshConn.Stderr.Reset()
+	// NOTE: we deliberately do NOT call sshConn.Stderr.Reset() here.
+	// The exec.Cmd started a copy goroutine that reads the child's
+	// stderr pipe and writes into sshConn.Stderr; that goroutine is
+	// still running until the process is reaped. Resetting the buffer
+	// concurrently with that goroutine's writes is a data race
+	// (confirmed under -race). The buffer is owned by this SSHConn,
+	// which is about to be dropped from the map and GC'd, so clearing
+	// it serves no purpose. monitorProcess's Wait goroutine is the
+	// one that reaps the process and drains the copy goroutine.
 	sshConn.Status = "stopped"
 	m.notifyStatus(id, "stopped")
 	delete(m.conns, id)
@@ -706,7 +837,8 @@ func FormatSSHCommand(cfg ForwardConfig) string {
 		"-o", "ServerAliveInterval=60",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ExitOnForwardFailure=yes",
-		"-o", "StrictHostKeyChecking=no",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=" + knownHostsPath(),
 		"-l", cfg.SSHUser,
 		cfg.RemoteHost,
 	}

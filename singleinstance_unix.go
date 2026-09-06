@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // acquireSingleInstanceLock takes an exclusive flock on a lock file so
@@ -17,8 +18,19 @@ import (
 // file must stay open for the process lifetime (closing it releases
 // the lock); a stale file after a crash is harmless because flock is
 // released automatically by the OS.
+//
+// The lock lives in the user's config directory (0700), NOT /tmp: on
+// multi-user systems /tmp is shared, so a second user's launch would
+// collide with the first user's lock (or vice versa).
 func acquireSingleInstanceLock() (*os.File, error) {
-	f, err := os.OpenFile("/tmp/ssh-tunnel-manager.lock", os.O_CREATE|os.O_RDWR, 0600)
+	dir, err := appConfigDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve config dir: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create config dir: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "ssh-tunnel-manager.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open lock file: %w", err)
 	}
@@ -30,9 +42,15 @@ func acquireSingleInstanceLock() (*os.File, error) {
 }
 
 // runtimeSocketPath returns the path of the local socket used by a
-// second launch to poke the first instance.
+// second launch to poke the first instance. Prefers XDG_RUNTIME_DIR
+// (per-user, world-writable) and falls back to the user's config dir
+// rather than a shared /tmp path.
 func runtimeSocketPath() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, "ssh-tunnel-manager.sock")
+	}
+	dir, err := appConfigDir()
+	if err == nil {
 		return filepath.Join(dir, "ssh-tunnel-manager.sock")
 	}
 	return filepath.Join(os.TempDir(), "ssh-tunnel-manager.sock")
@@ -64,7 +82,16 @@ func listenForShowRequests(showCh chan struct{}) {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return
+				// A transient error (e.g. EMFILE under load) must
+				// not kill the listener — a second launch would then
+				// fail to wake this instance and start a competing
+				// process. Retry after a brief pause. The listener
+				// is never closed in this process, so the only fatal
+				// case is the listener being closed, which is also
+				// harmless to retry.
+				Logf("show-request listener: Accept error: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 			select {
 			case showCh <- struct{}{}:

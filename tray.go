@@ -141,7 +141,17 @@ func circlePNG(c color.NRGBA) []byte {
 	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
-		return nil
+		// png.Encode of a 16x16 NRGBA image essentially never fails,
+		// but returning nil here would hand systray.SetIcon a nil
+		// slice and potentially panic. Fall back to a 1x1 pixel.
+		Logf("circlePNG: encode failed: %v", err)
+		fallback := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+		fallback.SetNRGBA(0, 0, c)
+		buf.Reset()
+		if err := png.Encode(&buf, fallback); err != nil {
+			Logf("circlePNG: fallback encode failed: %v", err)
+			return nil
+		}
 	}
 	return buf.Bytes()
 }

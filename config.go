@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -75,12 +76,21 @@ func (cm *ConfigManager) Load() error {
 		}
 	}
 
+	// Decrypt the API key in place as well.
+	if state.Settings.APIKey != "" {
+		pt, err := decryptPassword(state.Settings.APIKey)
+		if err != nil {
+			return fmt.Errorf("decrypt api key: %w", err)
+		}
+		state.Settings.APIKey = pt
+	}
+
 	cm.state = *state
 	return nil
 }
 
 // Save saves the current configuration to the JSON file. Encrypts
-// SSHPassword fields before writing.
+// SSHPassword and APIKey fields before writing.
 func (cm *ConfigManager) Save() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -99,6 +109,15 @@ func (cm *ConfigManager) Save() error {
 			}
 			snapshot.Forwards[i].SSHPassword = ct
 		}
+	}
+	// Encrypt the API key too — it is a live credential that should
+	// not sit in plaintext next to the (already encrypted) passwords.
+	if snapshot.Settings.APIKey != "" {
+		ct, err := encryptPassword(snapshot.Settings.APIKey)
+		if err != nil {
+			return fmt.Errorf("encrypt api key: %w", err)
+		}
+		snapshot.Settings.APIKey = ct
 	}
 
 	return SaveConfig(cm.filePath, &snapshot)
@@ -182,17 +201,44 @@ func LoadConfig(filePath string) (*AppState, error) {
 	return state, nil
 }
 
-// SaveConfig saves the application state to a JSON file
+// SaveConfig saves the application state to a JSON file.
+//
+// The state is written to a temporary file in the same directory, fsync'd,
+// and renamed into place. A crash or a concurrent writer mid-encode can
+// never leave a half-written config.json behind. The temp file is created
+// with 0600 permissions because the config holds encrypted passwords.
 func SaveConfig(filePath string, state *AppState) error {
-	file, err := os.Create(filePath)
+	dir := filepath.Dir(filePath)
+	tmp, err := os.CreateTemp(dir, ".ssh-tunnel-manager-*.json")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp config: %w", err)
 	}
-	defer file.Close()
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 
-	encoder := json.NewEncoder(file)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp config: %w", err)
+	}
+
+	encoder := json.NewEncoder(tmp)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(state)
+	if err := encoder.Encode(state); err != nil {
+		tmp.Close()
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("fsync temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp config: %w", err)
+	}
+
+	if err := os.Rename(tmpName, filePath); err != nil {
+		return fmt.Errorf("rename temp config: %w", err)
+	}
+	return nil
 }
 
 // DefaultConfig returns a default empty configuration
