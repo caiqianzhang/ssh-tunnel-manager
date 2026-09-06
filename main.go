@@ -58,6 +58,11 @@ func main() {
 	}
 	defer CloseLogger()
 
+	// Load Baidu Cloud DNS credentials (baidu.key) for fast IP
+	// resolution in the DDNS scenario. Disables itself silently
+	// if the file is absent.
+	InitBaiduDNS()
+
 	// A second launch (e.g. double-clicking the binary again) wakes
 	// the running instance instead of starting a competing process.
 	if notifyRunningInstance() {

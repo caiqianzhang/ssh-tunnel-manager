@@ -10,6 +10,9 @@ ssh-tunnel-manager.log
 secret.key
 config.json
 
+# Baidu Cloud DNS credentials (AK/SK) — keep local, never commit
+baidu.key
+
 # Vendored third-party deps are tracked (see third_party/),
 # but build cache and module downloads are not.
 /vendor/

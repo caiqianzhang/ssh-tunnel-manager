@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -104,14 +105,26 @@ func TestEncryptionIsNondeterministic(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	const plaintext = "secret"
-	a, _ := encryptPassword(plaintext)
-	b, _ := encryptPassword(plaintext)
+	a, err := encryptPassword(plaintext)
+	if err != nil {
+		t.Fatalf("encrypt a: %v", err)
+	}
+	b, err := encryptPassword(plaintext)
+	if err != nil {
+		t.Fatalf("encrypt b: %v", err)
+	}
 	if a == b {
 		t.Errorf("two encryptions of same plaintext produced same ciphertext (nonce reuse?)")
 	}
 	// Both must decrypt to the same plaintext.
-	pa, _ := decryptPassword(a)
-	pb, _ := decryptPassword(b)
+	pa, err := decryptPassword(a)
+	if err != nil {
+		t.Fatalf("decrypt a: %v", err)
+	}
+	pb, err := decryptPassword(b)
+	if err != nil {
+		t.Fatalf("decrypt b: %v", err)
+	}
 	if pa != plaintext || pb != plaintext {
 		t.Errorf("decrypt mismatch: %q / %q", pa, pb)
 	}
@@ -125,7 +138,10 @@ func TestCiphertextDoesNotLeakPlaintext(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	const plaintext = "supersecretpassword"
-	ct, _ := encryptPassword(plaintext)
+	ct, err := encryptPassword(plaintext)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
 	if strings.Contains(ct, plaintext) {
 		t.Errorf("ciphertext leaks plaintext: %q", ct)
 	}
@@ -133,7 +149,7 @@ func TestCiphertextDoesNotLeakPlaintext(t *testing.T) {
 
 // The secret key file is created with 0600 permissions (Unix).
 func TestSecretKeyFilePermissions(t *testing.T) {
-	if os.Getenv("GOOS") == "windows" {
+	if runtime.GOOS == "windows" {
 		t.Skip("unix file permissions not applicable")
 	}
 	tmp := t.TempDir()

@@ -467,6 +467,7 @@ func TestUIEventLoop(t *testing.T) {
 	cfg := NewConfigManager("test_config.json")
 	sshMgr := NewSSHManager()
 	ui := NewUI(cfg, sshMgr)
+	ui.AttachWindow(w)
 
 	done := make(chan error, 1)
 	go func() {
@@ -487,7 +488,18 @@ func TestUIEventLoop(t *testing.T) {
 		done <- nil
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// w.Event() blocks on the OS event queue, so the goroutine may not
+	// finish before the test returns. That's acceptable: the test
+	// verifies the event loop runs without panicking. If it does finish
+	// (e.g. the window receives a DestroyEvent), we check the error.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("event loop ended with error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// Still running — expected for a real window in a test.
+	}
 }
 
 // Regression test for the stale-connection bug: handleProcessExit

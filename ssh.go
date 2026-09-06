@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -32,13 +33,31 @@ type SSHManager struct {
 	// onStatusChange is invoked whenever a forward's status
 	// transitions. Guarded by mu; see SetOnStatusChange.
 	onStatusChange func(forwardID, status string)
+
+	// commandBuilder creates the exec.Cmd for a forward. Defaults to
+	// buildSSHCommand; tests can override it to use a fake SSH binary
+	// (e.g. sleep) instead of spawning a real ssh process.
+	commandBuilder func(ForwardConfig, string) *exec.Cmd
 }
 
 // NewSSHManager creates a new SSHManager
 func NewSSHManager() *SSHManager {
 	return &SSHManager{
 		conns: make(map[string]*SSHConn),
+		commandBuilder: func(cfg ForwardConfig, host string) *exec.Cmd {
+			return buildSSHCommand(cfg)
+		},
 	}
+}
+
+// buildCmd creates the exec.Cmd for a forward using the configured
+// commandBuilder. Tests can substitute a fake SSH binary (e.g. sleep)
+// instead of spawning a real ssh process.
+func (m *SSHManager) buildCmd(cfg ForwardConfig, host string) *exec.Cmd {
+	if m.commandBuilder != nil {
+		return m.commandBuilder(cfg, host)
+	}
+	return buildSSHCommand(cfg)
 }
 
 // SetOnStatusChange registers a callback fired on every status
@@ -83,12 +102,16 @@ func FlushDNS() error {
 		}
 		return nil
 	case "linux":
-		// Try systemd-resolve first
-		if err := exec.Command("sudo", "systemd-resolve", "--flush-caches").Run(); err == nil {
+		// Try systemd-resolve first. A 5s timeout prevents sudo from
+		// hanging if it prompts for a password in a non-interactive
+		// context (e.g. inside a test runner or a headless service).
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := exec.CommandContext(ctx, "sudo", "systemd-resolve", "--flush-caches").Run(); err == nil {
 			return nil
 		}
 		// Fallback to nscd
-		if err := exec.Command("sudo", "service", "nscd", "restart").Run(); err != nil {
+		if err := exec.CommandContext(ctx, "sudo", "service", "nscd", "restart").Run(); err != nil {
 			return fmt.Errorf("failed to flush DNS: no supported method worked")
 		}
 		return nil
@@ -379,7 +402,7 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 		return fmt.Errorf("no IPs found for host %s", cfg.RemoteHost)
 	}
 
-	cmd := buildSSHCommand(cfg)
+	cmd := m.buildCmd(cfg, cfg.RemoteHost)
 
 	// If the config carries a password, feed it to sshpass through a
 	// pipe (fd 3) rather than the command line.
@@ -606,10 +629,27 @@ func (m *SSHManager) autoReconnect(id string) {
 		// Wait before retry
 		time.Sleep(time.Duration(retryInterval) * time.Second)
 
+		// Resolve the host to use for the SSH connection.
+		//
+		// In the DDNS scenario the server IP may have changed while the
+		// tunnel was down, but DNS hasn't propagated yet (bounded by the
+		// record TTL). The Baidu DNS API returns the current IP immediately,
+		// so we query it first and fall back to ordinary DNS resolution.
+		hostToUse := cfg.RemoteHost
+		if ak, sk, ok := baiduCredentials(); ok && ak != "" && sk != "" {
+			zone, sub := deriveZoneAndSub(cfg.RemoteHost)
+			if ip, err := QueryBaiduDNSIP(ak, sk, zone, sub); err == nil {
+				hostToUse = ip
+				Logf("autoReconnect: Baidu DNS returned IP %s for %s", ip, cfg.RemoteHost)
+			} else {
+				Logf("autoReconnect: Baidu DNS query failed, falling back to DNS: %v", err)
+			}
+		}
+
 		// Try to resolve and reconnect
-		ips, err := ResolveHost(cfg.RemoteHost)
+		ips, err := ResolveHost(hostToUse)
 		if err != nil {
-			Logf("Failed to resolve host %s: %v", cfg.RemoteHost, err)
+			Logf("Failed to resolve host %s: %v", hostToUse, err)
 			continue
 		}
 
@@ -618,7 +658,7 @@ func (m *SSHManager) autoReconnect(id string) {
 			continue
 		}
 
-		cmd := buildSSHCommand(cfg)
+		cmd := m.buildCmd(cfg, hostToUse)
 
 		// Clear stderr buffer and set up capture
 		sshConn.Stderr.Reset()

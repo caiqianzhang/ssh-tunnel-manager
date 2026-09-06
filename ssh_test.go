@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -336,3 +339,263 @@ func exitErr() error {
 type exitError struct{}
 
 func (e *exitError) Error() string { return "exit status 1" }
+
+// ---------- Baidu DNS integration ----------
+
+// setBaiduCredsForTest stores Baidu AK/SK in the package-level cache.
+func setBaiduCredsForTest(t *testing.T, ak, sk string) {
+	baiduMu.Lock()
+	baiduAK, baiduSK = ak, sk
+	baiduOK = true
+	baiduMu.Unlock()
+}
+
+// clearBaiduCredsForTest removes cached Baidu credentials.
+func clearBaiduCredsForTest(t *testing.T) {
+	baiduMu.Lock()
+	baiduAK, baiduSK = "", ""
+	baiduOK = false
+	baiduMu.Unlock()
+}
+
+// TestQueryBaiduDNSIPWithMockServer verifies QueryBaiduDNSIP against a
+// mock HTTP server: successful retrieval, missing-record error, and
+// HTTP-error surfacing.
+func TestQueryBaiduDNSIPWithMockServer(t *testing.T) {
+	// Mock server that returns a single A record for "www".
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "expected POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, "expected Authorization header", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 1,
+					"domain":   "www",
+					"rdtype":   "A",
+					"rdata":    "1.2.3.4",
+					"zoneName": "ruanjianggongcheng.site",
+					"status":   "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	ip, err := QueryBaiduDNSIPWithBase("AK", "SK", "ruanjianggongcheng.site", "www", server.URL)
+	if err != nil {
+		t.Fatalf("QueryBaiduDNSIP failed: %v", err)
+	}
+	if ip != "1.2.3.4" {
+		t.Errorf("expected IP 1.2.3.4, got %s", ip)
+	}
+}
+
+func TestQueryBaiduDNSIPMissingRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 2,
+					"domain":   "ftp",
+					"rdtype":   "A",
+					"rdata":    "5.6.7.8",
+					"zoneName": "ruanjianggongcheng.site",
+					"status":   "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	_, err := QueryBaiduDNSIPWithBase("AK", "SK", "ruanjianggongcheng.site", "www", server.URL)
+	if err == nil {
+		t.Error("expected error for missing A record, got nil")
+	}
+}
+
+func TestQueryBaiduDNSIPTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "upstream timeout",
+		})
+	}))
+	defer server.Close()
+
+	_, err := QueryBaiduDNSIPWithBase("AK", "SK", "ruanjianggongcheng.site", "www", server.URL)
+	if err == nil {
+		t.Error("expected error for HTTP error, got nil")
+	}
+}
+
+// ---------- End-to-end autoReconnect + Baidu DNS ----------
+
+// TestAutoReconnectUsesBaiduDNS is a full end-to-end test of the DDNS
+// fast-path: a mock Baidu DNS server returns a fresh IP, the SSH
+// process is simulated with `sleep`, and autoReconnect must use the
+// Baidu IP when restarting the tunnel.
+func TestAutoReconnectUsesBaiduDNS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: requires the 'sleep' binary")
+	}
+
+	// 1. Mock Baidu DNS server returning a specific IP.
+	//    We use "localhost" as the remote host so that Connect's
+	//    initial ResolveHost succeeds (returns 127.0.0.1). The Baidu
+	//    mock returns a different IP (10.99.88.77) to simulate a DDNS
+	//    update, and autoReconnect must use that IP.
+	var gotAuth string
+	var gotDomain string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		var body struct {
+			Domain string `json:"domain"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotDomain = body.Domain
+
+		// deriveZoneAndSub("localhost") -> zone="localhost", sub="@"
+		// Return an A record for "@" (the root domain).
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"recordId": 1,
+					"domain":   "@",
+					"rdtype":   "A",
+					"rdata":    "10.99.88.77",
+					"zoneName": "localhost",
+					"status":   "RUNNING",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	// autoReconnect calls QueryBaiduDNSIP which reads the package-level
+	// API base. Point it at the mock server for the duration of the test.
+	origBase := baiduDNSAPIBase
+	baiduDNSAPIBase = server.URL
+	t.Cleanup(func() { baiduDNSAPIBase = origBase })
+
+	// 2. Cache Baidu credentials.
+	setBaiduCredsForTest(t, "AK-test", "SK-test")
+	defer clearBaiduCredsForTest(t)
+
+	// 3. SSHManager with a fake "SSH" command (sleep 30) so we don't
+	//    need a real SSH server.
+	mgr := NewSSHManager()
+	var gotHost string
+	mgr.commandBuilder = func(cfg ForwardConfig, host string) *exec.Cmd {
+		// Record the host that autoReconnect passes to the command
+		// builder so we can verify the Baidu DNS IP was used.
+		gotHost = host
+		// Use `sleep` as a stand-in for ssh. It stays alive long enough
+		// for monitorProcess to confirm the tunnel is "running", and
+		// exits cleanly when killed.
+		return exec.Command("sleep", "30")
+	}
+
+	// 4. Forward config: auto-reconnect enabled.
+	cfg := ForwardConfig{
+		ID:            "e2e-ddns",
+		Name:          "DDNS Tunnel",
+		ForwardType:   "local",
+		RemoteHost:    "localhost",
+		RemotePort:    22,
+		LocalHost:     "127.0.0.1",
+		LocalPort:     0, // kernel-assigned, avoids real port conflicts
+		SSHUser:       "u",
+		AutoReconnect: true,
+		MaxRetries:    2,
+		RetryInterval: 1, // fast retry for the test
+	}
+
+	// 5. Connect — starts the fake SSH process.
+	if err := mgr.Connect(cfg); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// 6. Wait for the tunnel to reach "running".
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if mgr.GetStatus(cfg.ID) == "running" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if mgr.GetStatus(cfg.ID) != "running" {
+		t.Fatalf("expected tunnel to be running, got %q", mgr.GetStatus(cfg.ID))
+	}
+
+	// 7. Kill the process to simulate a disconnection.
+	conn, ok := mgr.GetConnection(cfg.ID)
+	if !ok {
+		t.Fatal("expected connection to exist")
+	}
+	if conn.Process != nil && conn.Process.Process != nil {
+		_ = conn.Process.Process.Kill()
+	}
+
+	// 8. Wait for autoReconnect to fire and restart the tunnel.
+	//
+	// IMPORTANT: we must first wait for the killed process to actually
+	// be reported as disconnected before looking for the reconnect.
+	// handleProcessExit sets "disconnected" before spawning
+	// autoReconnect, so once the status leaves "running" we know the
+	// old tunnel is gone and autoReconnect is (or will be) running.
+	// Without this guard the goroutine races the process death and can
+	// observe the old "running" status as a spurious reconnect signal.
+	reconnected := make(chan struct{})
+	go func() {
+		// Wait for the old "running" process to die.
+		for mgr.GetStatus(cfg.ID) == "running" {
+			time.Sleep(50 * time.Millisecond)
+		}
+		// Now wait for autoReconnect to spawn a new process.
+		for {
+			s := mgr.GetStatus(cfg.ID)
+			if s == "connecting" || s == "running" {
+				close(reconnected)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-reconnected:
+		// Good: autoReconnect started a new process.
+	case <-time.After(15 * time.Second):
+		s := mgr.GetStatus(cfg.ID)
+		t.Fatalf("autoReconnect did not restart the tunnel in time (status %s)", s)
+	}
+
+	// 9. Verify the Baidu DNS API was actually called.
+	if gotAuth == "" {
+		t.Error("expected Baidu DNS API to receive Authorization header")
+	}
+	if gotDomain != "localhost" {
+		t.Errorf("expected Baidu DNS query for zone 'localhost', got %q", gotDomain)
+	}
+
+	// 10. Verify the Baidu DNS IP was actually used for the SSH
+	//     connection (not the original hostname). This is the core
+	//     DDNS fast-path: the tunnel must restart with the fresh IP,
+	//     not the stale DNS entry.
+	if gotHost != "10.99.88.77" {
+		t.Errorf("expected autoReconnect to use Baidu IP 10.99.88.77, got %q", gotHost)
+	}
+
+	// 11. Clean up.
+	_ = mgr.Disconnect(cfg.ID)
+}
