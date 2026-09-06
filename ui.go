@@ -788,11 +788,54 @@ func (ui *UI) saveSettings() {
 		return
 	}
 	Log("UI.saveSettings: config saved successfully")
-	ui.setTestResult("✓ 设置已保存", true)
 	ui.settingsExpanded = false
+
+	// 保存生效策略: if a tunnel for this forward exists in ANY state
+	// (connecting / running / failed), restart it with the new config —
+	// tunnels work on a config snapshot taken at Connect, so without a
+	// restart the hero card would show the new address while traffic
+	// still went to the old one, and a password fix would never reach
+	// autoReconnect.
+	if _, tracked := ui.ssh.GetConnection(id); tracked {
+		ui.setTestResult("✓ 设置已保存，正在以新配置重启隧道...", true)
+		ui.restartWithConfig(updated)
+	} else {
+		ui.setTestResult("✓ 设置已保存", true)
+	}
+
 	// The forward's domain may have changed — recompute the
 	// 域名解析优化 row against the new zone.
 	ui.refreshZoneForwardStatusAsync()
+}
+
+// restartWithConfig cleanly replaces an existing tunnel with one built
+// from the just-saved config. Runs off the UI thread; feedback goes
+// through setTestResult (thread-safe) and queueUIFunc for widget state.
+func (ui *UI) restartWithConfig(fwd ForwardConfig) {
+	go func() {
+		_ = ui.ssh.Disconnect(fwd.ID)
+
+		// Wait for the old ssh process to release the local port (it
+		// dies on Disconnect, but the kernel needs a moment).
+		for i := 0; i < 20; i++ {
+			inUse, _, err := ui.portChecker(fwd.LocalPort)
+			if err != nil || !inUse {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if inUse, processInfo, err := ui.portChecker(fwd.LocalPort); err == nil && inUse {
+			ui.queueUIFunc(func() {
+				ui.showConflictDialogInternal(fwd.LocalPort, processInfo, false)
+			})
+			return
+		}
+
+		if err := ui.ssh.Connect(fwd); err != nil {
+			ui.setTestResult(fmt.Sprintf("✗ 重启隧道失败: %v", err), false)
+		}
+	}()
 }
 
 // ═══════════════════════════════════════════════════════════════

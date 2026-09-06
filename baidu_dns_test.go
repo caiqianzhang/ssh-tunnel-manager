@@ -139,7 +139,12 @@ func TestDeriveZoneAndSub(t *testing.T) {
 		{"a.b.example.com", "example.com", "a.b"},
 		{"localhost", "localhost", "@"},
 		{"single", "single", "@"},
-		{"sub.domain.co.uk", "co.uk", "sub.domain"},
+		// Two-label public suffixes: the zone is three labels.
+		{"www.bbc.co.uk", "bbc.co.uk", "www"},
+		{"site.co.uk", "site.co.uk", "@"},
+		{"mail.example.com.cn", "example.com.cn", "mail"},
+		// Unknown two-label combos fall back to the two-label rule.
+		{"sub.domain.co.xy", "co.xy", "sub.domain"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.host, func(t *testing.T) {

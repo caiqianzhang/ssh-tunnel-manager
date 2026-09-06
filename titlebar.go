@@ -24,9 +24,9 @@ const titleBarHeight = 32
 var dragTag = new(int)
 
 // layoutTitleBar draws the custom window decorations: the app title
-// centered in the bar (the whole bar doubles as the drag handle) and
-// the window control buttons top-right. The platform title bar is
-// disabled via app.Decorated(false).
+// centered on the FULL bar width (matching native title bars) and the
+// window control buttons top-right. The platform title bar is disabled
+// via app.Decorated(false).
 func (ui *UI) layoutTitleBar(gtx layout.Context) layout.Dimensions {
 	h := gtx.Dp(titleBarHeight)
 	gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
@@ -35,37 +35,44 @@ func (ui *UI) layoutTitleBar(gtx layout.Context) layout.Dimensions {
 	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
 	paint.Fill(gtx.Ops, ColorCard)
 
-	return layout.Inset{Left: 10, Right: 6}.Layout(gtx,
-		func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-				// Title cell doubles as a drag handle: ActionMove
-				// makes the platform move the window on press-drag.
-				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
-					// The ActionMove op must attach to its own
-					// registered input area, hence the event.Op here.
-					// While a modal dialog is open the drag area is
-					// disabled: otherwise clicks landing on dialog
-					// controls that overlap this region get swallowed
-					// as window-move gestures.
-					if !ui.showPortConflictDialog {
-						event.Op(gtx.Ops, dragTag)
-						system.ActionInputOp(system.ActionMove).Add(gtx.Ops)
-					}
-					lbl := material.Caption(ui.theme, "SSH 隧道管理器")
-					lbl.Color = ColorTextSec
-					lbl.Font.Weight = font.Normal
-					// Centered in the bar on both axes, matching the
-					// look of native title bars.
-					return layout.Center.Layout(gtx, lbl.Layout)
-				}),
-				layout.Rigid(ui.titleBarBtn(&ui.minBtn, "–", false)),
-				layout.Rigid(layout.Spacer{Width: 4}.Layout),
-				layout.Rigid(ui.titleBarBtn(&ui.maxBtn, "□", false)),
-				layout.Rigid(layout.Spacer{Width: 4}.Layout),
-				layout.Rigid(ui.titleBarBtn(&ui.closeBtn, "✕", true)),
-			)
-		},
+	return layout.Stack{Alignment: layout.Center}.Layout(gtx,
+		// Layer 1: the whole bar is the drag surface. The ActionMove op
+		// must attach to its own registered input area, hence the
+		// event.Op here. While a modal dialog is open the drag area is
+		// disabled: otherwise clicks landing on dialog controls that
+		// overlap this region get swallowed as window-move gestures.
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			if !ui.showPortConflictDialog {
+				event.Op(gtx.Ops, dragTag)
+				system.ActionInputOp(system.ActionMove).Add(gtx.Ops)
+			}
+			return layout.Dimensions{Size: gtx.Constraints.Max}
+		}),
+		// Layer 2: window control buttons, pinned right. Declared after
+		// the drag layer, so their clickable areas take precedence over
+		// the drag area beneath them.
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			return layout.E.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Inset{Right: 6}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+						layout.Rigid(ui.titleBarBtn(&ui.minBtn, "–", false)),
+						layout.Rigid(layout.Spacer{Width: 4}.Layout),
+						layout.Rigid(ui.titleBarBtn(&ui.maxBtn, "□", false)),
+						layout.Rigid(layout.Spacer{Width: 4}.Layout),
+						layout.Rigid(ui.titleBarBtn(&ui.closeBtn, "✕", true)),
+					)
+				})
+			})
+		}),
+		// Layer 3: the caption, centered by the Stack on both axes. It
+		// registers no input ops, so presses over the text still reach
+		// the drag surface below.
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Caption(ui.theme, "SSH 隧道管理器")
+			lbl.Color = ColorTextSec
+			lbl.Font.Weight = font.Normal
+			return lbl.Layout(gtx)
+		}),
 	)
 }
 

@@ -365,23 +365,45 @@ func ResolveRealIP(host string) (ip string, ok bool) {
 	return ip, true
 }
 
+// multiPartTLDs are common two-label public suffixes (registry-managed
+// second-level domains). For hosts under these, the registrable zone is
+// three labels, not two — "www.bbc.co.uk" belongs to zone "bbc.co.uk",
+// not "co.uk". Not exhaustive: it covers the suffixes a DDNS user is
+// realistically on; anything else falls back to the two-label rule.
+var multiPartTLDs = map[string]bool{
+	"co.uk": true, "org.uk": true, "ac.uk": true, "gov.uk": true, "me.uk": true,
+	"com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true,
+	"com.hk": true, "org.hk": true, "com.tw": true, "org.tw": true,
+	"com.jp": true, "ne.jp": true, "or.jp": true, "co.jp": true,
+	"com.kr": true, "co.kr": true, "or.kr": true,
+	"com.au": true, "net.au": true, "org.au": true,
+	"com.sg": true, "com.br": true, "com.mx": true, "com.ar": true,
+	"com.tr": true, "co.in": true, "co.nz": true, "co.za": true,
+}
+
 // deriveZoneAndSub splits a hostname into zone (registered domain) and
-// subdomain. Heuristic: the zone is the last two labels, the subdomain
-// is everything before that.
+// subdomain. Heuristic: the zone is the last two labels — or the last
+// three when they end in a known two-label public suffix.
 //
-//	"www.example.com"  -> zone="example.com",  sub="www"
-//	"example.com"      -> zone="example.com",  sub="@"
-//	"a.b.example.com"  -> zone="example.com",  sub="a.b"
+//	"www.example.com"  -> zone="example.com",       sub="www"
+//	"example.com"      -> zone="example.com",       sub="@"
+//	"a.b.example.com"  -> zone="example.com",       sub="a.b"
+//	"www.bbc.co.uk"    -> zone="bbc.co.uk",         sub="www"
+//	"site.co.uk"       -> zone="site.co.uk",        sub="@"
 func deriveZoneAndSub(host string) (zone, sub string) {
 	labels := strings.Split(host, ".")
 	if len(labels) < 2 {
 		return host, "@"
 	}
-	zone = strings.Join(labels[len(labels)-2:], ".")
-	if len(labels) == 2 {
+	n := 2
+	if len(labels) >= 3 && multiPartTLDs[strings.Join(labels[len(labels)-2:], ".")] {
+		n = 3
+	}
+	zone = strings.Join(labels[len(labels)-n:], ".")
+	if len(labels) == n {
 		sub = "@"
 	} else {
-		sub = strings.Join(labels[:len(labels)-2], ".")
+		sub = strings.Join(labels[:len(labels)-n], ".")
 	}
 	return zone, sub
 }
