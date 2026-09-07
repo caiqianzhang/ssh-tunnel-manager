@@ -10,17 +10,28 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Each platform builds on its own runner: macOS needs CGO + the
+    # Cocoa SDK, which cross-compiling from Linux cannot provide.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
-        exclude:
-          # No ARM64 Windows target in the Makefile; keep the matrix
-          # small and skip the combination nobody ships.
-          - goos: windows
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+          - goos: linux
             goarch: arm64
+            runner: ubuntu-24.04-arm
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+          - goos: darwin
+            goarch: amd64
+            runner: macos-latest
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -29,15 +40,16 @@ jobs:
         with:
           go-version: '1.26'
 
-      # Gio's Linux backend compiles against X11/Wayland via pkg-config;
-      # the stock Ubuntu runner has none of those dev headers.
+      # Gio's Linux backend compiles against X11/Wayland/Vulkan via
+      # pkg-config; the stock Ubuntu runner has none of those dev headers.
       - name: Install graphics dev headers
         if: matrix.goos == 'linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+            libwayland-dev libvulkan-dev \
+            libegl1-mesa-dev libgles2-mesa-dev
 
       - name: Build binaries
         shell: bash
@@ -55,8 +67,8 @@ jobs:
             go build -ldflags "$ldflags" \
             -o "dist/querydns-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" ./cmd/querydns
 
-      # Only one matrix job creates the release; otherwise every platform
-      # would race to create (and then edit) the same release.
+      # Only one job creates the release; otherwise every platform would
+      # race to create (and then edit) the same release.
       - name: Create GitHub Release
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         uses: softprops/action-gh-release@v2
