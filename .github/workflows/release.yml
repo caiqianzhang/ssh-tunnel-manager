@@ -29,6 +29,16 @@ jobs:
         with:
           go-version: '1.26'
 
+      # Gio's Linux backend compiles against X11/Wayland via pkg-config;
+      # the stock Ubuntu runner has none of those dev headers.
+      - name: Install graphics dev headers
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+
       - name: Build binaries
         shell: bash
         run: |
@@ -45,7 +55,10 @@ jobs:
             go build -ldflags "$ldflags" \
             -o "dist/querydns-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" ./cmd/querydns
 
+      # Only one matrix job creates the release; otherwise every platform
+      # would race to create (and then edit) the same release.
       - name: Create GitHub Release
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
