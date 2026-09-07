@@ -1,6 +1,6 @@
 # SSH Tunnel Manager
 
-A small cross-platform desktop app that manages SSH local/remote port
+[中文](README.zh.md) · A small cross-platform desktop app that manages SSH local/remote port
 forwards, written in Go with [Gio](https://gioui.org). Runs as a tray
 application: the tray icon reflects the tunnel status and the menu
 lets you connect, disconnect and restore the window.

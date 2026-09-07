@@ -48,7 +48,7 @@ type AppSettings struct {
 	DDNSCheckInterval int `json:"ddns_check_interval,omitempty"`
 	// DNSResolver is the DNS server used to resolve DDNS hostnames when
 	// the Baidu DNS API is unavailable. Empty means "use the system
-	// resolver"; a public resolver like 8.8.8.8 avoids stale local
+	// resolver"; Baidu's public DNS (119.29.29.29) avoids stale local
 	// caches (see ssh.ResolveHost).
 	DNSResolver string `json:"dns_resolver,omitempty"`
 }
