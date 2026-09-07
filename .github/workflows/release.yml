@@ -8,6 +8,11 @@ on:
   push:
     tags: ['v*']
 
+# The default GITHUB_TOKEN cannot create releases; without this the
+# "Create GitHub Release" step fails with a 403.
+permissions:
+  contents: write
+
 jobs:
   build:
     # Each platform builds on its own runner: macOS needs CGO + the
