@@ -1,0 +1,52 @@
+name: release
+
+# Building releases is expensive and only meaningful for a published
+# version, so it is gated on a tag push (v1.2.3, v1.2.3-rc1, …) rather
+# than every commit. Ordinary pushes and PRs run the cheap test.yml
+# workflow instead.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # No ARM64 Windows target in the Makefile; keep the matrix
+          # small and skip the combination nobody ships.
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          version="${GITHUB_REF_NAME#v}"
+          ldflags="-s -w -X main.appVersion=${version}"
+          suffix=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then suffix=".exe"; fi
+
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags "$ldflags" \
+            -o "dist/ssh-tunnel-manager-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" .
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags "$ldflags" \
+            -o "dist/querydns-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" ./cmd/querydns
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
