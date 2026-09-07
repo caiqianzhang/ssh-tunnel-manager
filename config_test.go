@@ -388,6 +388,40 @@ func TestDDNSCheckIntervalRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDNSResolverRoundTrip verifies the settings.dns_resolver field
+// survives Save → Load through the ConfigManager.
+func TestDNSResolverRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	cm := NewConfigManager(path)
+	cm.SetDNSResolver("1.1.1.1")
+	if err := cm.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	cm2 := NewConfigManager(path)
+	if err := cm2.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cm2.GetDNSResolver(); got != "1.1.1.1" {
+		t.Errorf("expected dns_resolver 1.1.1.1 after round trip, got %q", got)
+	}
+
+	// Empty must stay empty — it means "use the system resolver".
+	path2 := filepath.Join(t.TempDir(), "empty.json")
+	cm3 := NewConfigManager(path2)
+	if err := cm3.Save(); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	cm4 := NewConfigManager(path2)
+	if err := cm4.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cm4.GetDNSResolver(); got != "" {
+		t.Errorf("expected unset dns_resolver to stay empty, got %q", got)
+	}
+}
+
 // TestSaveRefusesWhenReadOnly pins the data-loss protection: when the
 // initial Load failed (corrupt file, missing secret key), Save must
 // refuse to overwrite the on-disk config with in-memory defaults, and

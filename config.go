@@ -46,6 +46,11 @@ type AppSettings struct {
 	// DDNSCheckInterval is the DDNS heartbeat period in seconds.
 	// 0 (unset) means "use DefaultDDNSIntervalSeconds".
 	DDNSCheckInterval int `json:"ddns_check_interval,omitempty"`
+	// DNSResolver is the DNS server used to resolve DDNS hostnames when
+	// the Baidu DNS API is unavailable. Empty means "use the system
+	// resolver"; a public resolver like 8.8.8.8 avoids stale local
+	// caches (see ssh.ResolveHost).
+	DNSResolver string `json:"dns_resolver,omitempty"`
 }
 
 // ConfigManager manages configuration persistence and operations
@@ -329,4 +334,21 @@ func (cm *ConfigManager) SetDDNSCheckInterval(seconds int) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.state.Settings.DDNSCheckInterval = seconds
+}
+
+// GetDNSResolver returns the DNS server used for DDNS hostname
+// resolution when the Baidu DNS API is unavailable. Empty means "use
+// the system resolver".
+func (cm *ConfigManager) GetDNSResolver() string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.state.Settings.DNSResolver
+}
+
+// SetDNSResolver stores the DNS server used for DDNS hostname
+// resolution. Pass an empty string to fall back to the system resolver.
+func (cm *ConfigManager) SetDNSResolver(server string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state.Settings.DNSResolver = server
 }

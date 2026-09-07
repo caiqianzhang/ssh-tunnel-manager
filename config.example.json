@@ -17,6 +17,7 @@
   ],
   "settings": {
     "api_key": "<your_api_key>",
-    "ddns_check_interval": 15
+    "ddns_check_interval": 15,
+    "dns_resolver": "8.8.8.8"
   }
 }

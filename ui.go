@@ -65,6 +65,7 @@ type UI struct {
 	sshPasswordEntry  widget.Editor
 	apiKeyEntry       widget.Editor
 	ddnsIntervalEntry widget.Editor
+	dnsResolverEntry  widget.Editor
 	autoReconnect     widget.Bool
 	forwardLocal      widget.Bool
 
@@ -190,6 +191,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 	u.apiKeyEntry.SingleLine = true
 	u.apiKeyEntry.Mask = '•' // Mask the API key for security
 	u.ddnsIntervalEntry.SingleLine = true
+	u.dnsResolverEntry.SingleLine = true
 	// Mask the stored SSH password too: it would otherwise sit in
 	// plaintext on screen for the whole session, and saveSettings'
 	// "empty field = keep stored password" rule only makes sense for a
@@ -232,6 +234,15 @@ func (ui *UI) loadConfigToForm() {
 		interval = DefaultDDNSIntervalSeconds
 	}
 	ui.ddnsIntervalEntry.SetText(strconv.Itoa(interval))
+
+	// DNS resolver: show the configured value; default to Google DNS
+	// (8.8.8.8) when unset so the DDNS fallback does not use the stale
+	// local system resolver.
+	dnsResolver := ui.config.GetDNSResolver()
+	if dnsResolver == "" {
+		dnsResolver = "8.8.8.8"
+	}
+	ui.dnsResolverEntry.SetText(dnsResolver)
 }
 
 func (ui *UI) Layout(gtx layout.Context) layout.Dimensions {
@@ -295,6 +306,7 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	ui.sshPasswordEntry.Update(gtx)
 	ui.apiKeyEntry.Update(gtx)
 	ui.ddnsIntervalEntry.Update(gtx)
+	ui.dnsResolverEntry.Update(gtx)
 	ui.newPortEntry.Update(gtx)
 
 	// Snapshot testing under the lock: testAPI writes it from a
@@ -710,6 +722,7 @@ func (ui *UI) saveSettings() {
 	forwards := ui.config.GetForwards()
 	prevAPIKey := ui.config.GetAPIKey()
 	prevDDNS := ui.config.GetDDNSCheckInterval()
+	prevDNSResolver := ui.config.GetDNSResolver()
 	var id string
 	var existing ForwardConfig
 	hadExisting := false
@@ -790,6 +803,13 @@ func (ui *UI) saveSettings() {
 		ui.ssh.SetDDNSCheckInterval(time.Duration(DefaultDDNSIntervalSeconds) * time.Second)
 	}
 
+		// Save the DNS resolver and live-apply it: the fallback resolver
+		// is read from this package-level var by ssh.ResolveHost, so it
+		// takes effect for tunnels started or reconnected from now on.
+		dnsResolver := strings.TrimSpace(ui.dnsResolverEntry.Text())
+		ui.config.SetDNSResolver(dnsResolver)
+		SetDNSResolver(dnsResolver)
+
 	// Bug 5: report save failure to the user and keep them on the
 	// settings page so they can retry. Roll back the in-memory state so
 	// the app doesn't keep running on values that failed to persist.
@@ -798,13 +818,14 @@ func (ui *UI) saveSettings() {
 		Logf("UI.saveSettings: save error: %v", err)
 		ui.config.RestoreAppState(AppState{
 			Forwards: forwards,
-			Settings: AppSettings{APIKey: prevAPIKey, DDNSCheckInterval: prevDDNS},
+			Settings: AppSettings{APIKey: prevAPIKey, DDNSCheckInterval: prevDDNS, DNSResolver: prevDNSResolver},
 		})
 		if prevDDNS > 0 {
 			ui.ssh.SetDDNSCheckInterval(time.Duration(prevDDNS) * time.Second)
 		} else {
 			ui.ssh.SetDDNSCheckInterval(time.Duration(DefaultDDNSIntervalSeconds) * time.Second)
 		}
+		SetDNSResolver(prevDNSResolver)
 		ui.loadConfigToForm()
 		ui.setTestResult(fmt.Sprintf("✗ 保存失败: %v", err), false)
 		return

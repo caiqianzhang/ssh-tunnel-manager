@@ -225,11 +225,45 @@ func FlushDNS() error {
 	}
 }
 
-// ResolveHost resolves a hostname to a list of IP addresses
+// dnsResolver is the DNS server used by ResolveHost when the Baidu DNS
+// fast-path is unavailable. It is a public resolver (default 8.8.8.8)
+// rather than the local system resolver: for DDNS hosts the local cache
+// is exactly what we are trying to bypass, so falling back to it would
+// silently defeat the purpose. Override via SetDNSResolver (set from
+// the settings page).
+var dnsResolver = "8.8.8.8"
+
+// SetDNSResolver configures the resolver used by ResolveHost. Pass an
+// empty string to fall back to the local system resolver.
+func SetDNSResolver(server string) {
+	dnsResolver = server
+}
+
+// ResolveHost resolves a hostname to a list of IP addresses.
+//
+// When a DNS server is configured it queries that server directly,
+// bypassing the local system resolver (and its stale cache) — this is
+// the DDNS fallback path. When no server is configured it uses the
+// ordinary system resolver.
 func ResolveHost(host string) ([]string, error) {
-	ips, err := net.LookupHost(host)
+	if dnsResolver == "" {
+		ips, err := net.LookupHost(host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve host %s: %v", host, err)
+		}
+		return ips, nil
+	}
+
+	resolver := &net.Resolver{
+		StrictErrors: true,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			return d.DialContext(ctx, "udp", dnsResolver+":53")
+		},
+	}
+	ips, err := resolver.LookupHost(context.Background(), host)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve host %s: %v", host, err)
+		return nil, fmt.Errorf("failed to resolve host %s via %s: %v", host, dnsResolver, err)
 	}
 	return ips, nil
 }

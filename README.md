@@ -80,6 +80,13 @@ Copy it to `config.json` (it is created automatically on first run) and
 edit the values before connecting. `settings.api_key` is the Anthropic
 API key sent through the tunnel by the in-app 测试 button (optional).
 
+When `baidu.key` is present the app uses the Baidu Cloud DNS API to
+resolve the forwarded hostname; when it is absent it falls back to the
+DNS server in `settings.dns_resolver` (default `8.8.8.8`) instead of
+the local system resolver, because for a DDNS host the local cache is
+exactly the stale record we are trying to avoid. Set
+`settings.dns_resolver` to an empty string to use the system resolver.
+
 ## Project layout
 
 | Path | Contents |

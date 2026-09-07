@@ -56,6 +56,8 @@ func (ui *UI) settingsCardAdvanced(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceBetween}.Layout(gtx,
 			layout.Rigid(ui.settingsField(gtx, "DDNS 探测周期(秒)", &ui.ddnsIntervalEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
+			layout.Rigid(ui.settingsField(gtx, "DNS 解析服务器", &ui.dnsResolverEntry)),
+			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(checkbox(&ui.autoReconnect, "自动重连")),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(checkbox(&ui.forwardLocal, "本地转发 (-L)")),
