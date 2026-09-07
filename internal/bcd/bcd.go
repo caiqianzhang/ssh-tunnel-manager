@@ -81,7 +81,7 @@ func SignRequest(accessKey, secretKey, method, path string, now time.Time) strin
 func LoadCredentials(path string) (ak, sk string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("read baidu.key %q: %w", path, err)
 	}
 
 	for _, line := range strings.Split(string(data), "\n") {
@@ -111,7 +111,7 @@ func LoadCredentials(path string) (ak, sk string, err error) {
 	}
 
 	if ak == "" || sk == "" {
-		return "", "", fmt.Errorf("baidu.key missing AK or SK")
+		return "", "", fmt.Errorf("%s missing AK or SK", path)
 	}
 	return ak, sk, nil
 }

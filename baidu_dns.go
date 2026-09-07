@@ -34,6 +34,14 @@ var (
 	baiduBaseMu     sync.RWMutex
 )
 
+// sharedHTTPClient reuses connections across Baidu DNS API calls.
+// QueryBaiduDNSIP runs in the DDNS heartbeat goroutine (every 15s) and
+// on each SSH connect, so a pooled client avoids a fresh TCP/TLS
+// handshake on every call.
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
 // baiduAPIBase returns the current API base URL.
 func baiduAPIBase() string {
 	baiduBaseMu.RLock()
@@ -170,8 +178,11 @@ func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) 
 			var errPayload struct {
 				Message string `json:"message"`
 			}
-			json.Unmarshal(respBody, &errPayload)
-			return nil, fmt.Errorf("百度云 DNS %s HTTP %d: %s", path, resp.StatusCode, errPayload.Message)
+			detail := strings.TrimSpace(string(respBody))
+			if json.Unmarshal(respBody, &errPayload) == nil && errPayload.Message != "" {
+				detail = errPayload.Message
+			}
+			return nil, fmt.Errorf("百度云 DNS %s HTTP %d: %s", path, resp.StatusCode, detail)
 		}
 
 		// Some endpoints (e.g. edit) return an empty body on success.
@@ -207,12 +218,11 @@ func QueryBaiduDNSIP(accessKey, secretKey, zone, sub string) (string, error) {
 // explicit API base URL. It exists so tests can point at a mock server
 // without touching the production constant.
 func QueryBaiduDNSIPWithBase(accessKey, secretKey, zone, sub, apiBase string) (string, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
+	// Reuse a pooled client: QueryBaiduDNSIP runs in the DDNS heartbeat
+	// goroutine (every 15s) and on each SSH connect, so a fresh client
+	// per call pays a needless TCP/TLS handshake every time.
 	target := NewDnsTarget(accessKey, secretKey, zone, sub, apiBase)
-	records, err := target.listRecords(client)
+	records, err := target.listRecords(sharedHTTPClient)
 	if err != nil {
 		return "", err
 	}

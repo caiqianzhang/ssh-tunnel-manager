@@ -63,7 +63,7 @@ func main() {
 
 	// Query ALL records for the domain
 	path := "/v1/domain/resolve/list"
-	body := fmt.Sprintf(`{"domain":"%s","pageNo":1,"pageSize":100}`, zone)
+	body := fmt.Sprintf(`{"domain":%q,"pageNo":1,"pageSize":100}`, zone)
 
 	req, err := http.NewRequest("POST", apiBase+bcd.CanonicalURI(path), strings.NewReader(body))
 	if err != nil {
@@ -86,7 +86,11 @@ func main() {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "querydns: read response: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("=== Response (HTTP %d) ===\n%s\n", resp.StatusCode, string(respBody))
 
 	// Parse and display records
@@ -109,7 +113,10 @@ func main() {
 			Status   string `json:"status"`
 			TTL      int    `json:"ttl"`
 		}
-		json.Unmarshal(r, &rec)
+		if err := json.Unmarshal(r, &rec); err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: record[%d] parse error: %v\n", i, err)
+			continue
+		}
 		fmt.Printf("[%d] domain=%s rdtype=%s rdata=%s status=%s ttl=%d\n",
 			i, rec.Domain, rec.RDType, rec.RData, rec.Status, rec.TTL)
 	}
