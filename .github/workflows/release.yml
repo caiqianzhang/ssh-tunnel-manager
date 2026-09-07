@@ -8,15 +8,15 @@ on:
   push:
     tags: ['v*']
 
-# The default GITHUB_TOKEN cannot create releases; without this the
-# "Create GitHub Release" step fails with a 403.
 permissions:
   contents: write
 
 jobs:
+  # Build every platform on its own runner. macOS needs CGO + the Cocoa
+  # SDK, which cross-compiling from Linux cannot provide, so each OS
+  # builds natively. Each job uploads its binaries as a job artifact;
+  # the release job below collects them all.
   build:
-    # Each platform builds on its own runner: macOS needs CGO + the
-    # Cocoa SDK, which cross-compiling from Linux cannot provide.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -74,11 +74,36 @@ jobs:
             go build -ldflags "$ldflags" \
             -o "dist/querydns-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" ./cmd/querydns
 
-      # Only one job creates the release; otherwise every platform would
-      # race to create (and then edit) the same release.
+      # Upload this platform's binaries so the release job can collect
+      # them all into one GitHub Release.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  # Wait for every platform, then publish one release holding all the
+  # binaries. Doing this in a separate job avoids every platform racing
+  # to create (and then edit) the same release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten binaries into one directory
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -type f -name 'ssh-tunnel-manager-*' -exec cp {} release/ \;
+          find dist -type f -name 'querydns-*' -exec cp {} release/ \;
+          ls -l release/
+
       - name: Create GitHub Release
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/*
+          files: release/*
