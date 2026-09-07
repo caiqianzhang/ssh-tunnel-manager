@@ -26,9 +26,11 @@ jobs:
           - goos: windows
             goarch: amd64
             runner: windows-latest
+          # macos-latest is Apple Silicon; darwin/amd64 needs the Intel
+          # runner so CGO can find the x86_64 Cocoa SDK.
           - goos: darwin
             goarch: amd64
-            runner: macos-latest
+            runner: macos-13
           - goos: darwin
             goarch: arm64
             runner: macos-latest
@@ -47,8 +49,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libvulkan-dev \
+            libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcursor-dev libxfixes-dev libwayland-dev libvulkan-dev \
             libegl1-mesa-dev libgles2-mesa-dev
 
       - name: Build binaries
