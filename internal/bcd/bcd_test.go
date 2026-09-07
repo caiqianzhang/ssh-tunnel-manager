@@ -10,7 +10,6 @@ import (
 
 // signRequestVector is the expected Authorization header value for
 // AK-test/SK-test, POST /v1/domain/resolve/list at 2026-09-03T00:00:00Z.
-// Cross-checked against the Rust reference (docs/reference/baidu_dns.rs).
 const signRequestVector = "bce-auth-v1/AK-test/2026-09-03T00:00:00Z/1800/host/" +
 	"a00258c153b0f641b659621076d3133ca6950608606eff1d7729b7e2332a5d85"
 
