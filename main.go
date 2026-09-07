@@ -130,9 +130,18 @@ func main() {
 	}
 
 	// Repaint immediately on tunnel status transitions instead of
-	// waiting for the next interaction-driven frame.
+	// waiting for the next interaction-driven frame; surface terminal
+	// failures (no auto-reconnect follows) in the message banner.
 	sshMgr.SetOnStatusChange(func(forwardID, status string) {
 		invalidateWindow()
+	})
+	sshMgr.SetOnTerminalFailure(func(forwardID, status string) {
+		invalidateWindow()
+		if msg := terminalFailureText(status); msg != "" {
+			if ui := currentUI(); ui != nil {
+				ui.queueUIFunc(func() { ui.setTestResult(msg, false) })
+			}
+		}
 	})
 
 	// Tray show-request consumer. A live window — even minimized — is
@@ -198,13 +207,21 @@ func main() {
 			// ssh process already binds the local port, so a naive
 			// port check would flag our own socket as a conflict and
 			// let the user kill their own tunnel.
-			switch sshMgr.GetStatus(fwd.ID) {
+			switch status := sshMgr.GetStatus(fwd.ID); status {
 			case "running":
 				sshMgr.Disconnect(fwd.ID)
 				return
 			case "connecting":
 				Log("trayConnect: tunnel is connecting — ignoring click")
 				return
+			default:
+				// A previously failed attempt leaves a tracked conn
+				// behind; clean it up or Connect would refuse with
+				// "already exists" and the tray path would be dead
+				// until the window button was used.
+				if status != "not_found" {
+					_ = sshMgr.Disconnect(fwd.ID)
+				}
 			}
 			inUse, processInfo, err := CheckPortInUse(fwd.LocalPort)
 			if err != nil {
@@ -267,6 +284,12 @@ func runAppLoop(showReq chan struct{}, cfg *ConfigManager, sshMgr *SSHManager) {
 			if ui == nil {
 				Log("runAppLoop: creating UI for the first time")
 				ui = NewUI(cfg, sshMgr)
+				if cfg.IsReadOnly() {
+					// Make the protection visible at startup — a silent
+					// read-only mode would only be discovered when a
+					// save gets refused much later.
+					ui.setTestResult("⚠ 配置加载失败，已进入只读保护：修改不会保存（详见日志）", false)
+				}
 				// Compute the 域名解析优化 row (DNS lookups) off the
 				// UI thread once the config is loaded.
 				ui.refreshZoneForwardStatusAsync()

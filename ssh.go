@@ -56,6 +56,12 @@ type SSHManager struct {
 	// the UI show a dead tunnel).
 	notifyCh chan notifyMsg
 
+	// onTerminalFailure, when set, fires for terminal failures the user
+	// must see (auth_failed, retry exhaustion, ...) — transitions where
+	// no auto-reconnect follows, so the pending "连接中..." banner would
+	// otherwise stick around forever. Guarded by mu.
+	onTerminalFailure func(forwardID, status string)
+
 	// commandBuilder creates the exec.Cmd for a forward. Defaults to
 	// buildSSHCommand; tests can override it to use a fake SSH binary
 	// (e.g. sleep) instead of spawning a real ssh process.
@@ -72,6 +78,10 @@ type SSHManager struct {
 type notifyMsg struct {
 	id     string
 	status string
+	// terminal marks a failure with no auto-reconnect follow-up — the
+	// UI should surface it instead of waiting for a state that never
+	// comes.
+	terminal bool
 }
 
 // NewSSHManager creates a new SSHManager
@@ -90,13 +100,25 @@ func NewSSHManager() *SSHManager {
 		for msg := range m.notifyCh {
 			m.mu.RLock()
 			fn := m.onStatusChange
+			tf := m.onTerminalFailure
 			m.mu.RUnlock()
 			if fn != nil {
 				fn(msg.id, msg.status)
 			}
+			if msg.terminal && tf != nil {
+				tf(msg.id, msg.status)
+			}
 		}
 	}()
 	return m
+}
+
+// SetOnTerminalFailure registers a callback for terminal failures (see
+// notifyTerminalStatus). Same contract as SetOnStatusChange.
+func (m *SSHManager) SetOnTerminalFailure(fn func(forwardID, status string)) {
+	m.mu.Lock()
+	m.onTerminalFailure = fn
+	m.mu.Unlock()
 }
 
 // SetDDNSCheckInterval sets the DDNS heartbeat period. Safe to call
@@ -132,8 +154,19 @@ func (m *SSHManager) SetOnStatusChange(fn func(forwardID, status string)) {
 // the registered callback. Safe to call while holding m.mu: the
 // callback is invoked from the dispatcher goroutine.
 func (m *SSHManager) notifyStatus(forwardID, status string) {
+	m.notifyStatusKind(forwardID, status, false)
+}
+
+// notifyTerminalStatus queues a terminal failure for dispatch: it fires
+// both onStatusChange and onTerminalFailure, letting the UI surface the
+// failure immediately (no auto-reconnect will follow).
+func (m *SSHManager) notifyTerminalStatus(forwardID, status string) {
+	m.notifyStatusKind(forwardID, status, true)
+}
+
+func (m *SSHManager) notifyStatusKind(forwardID, status string, terminal bool) {
 	select {
-	case m.notifyCh <- notifyMsg{id: forwardID, status: status}:
+	case m.notifyCh <- notifyMsg{id: forwardID, status: status, terminal: terminal}:
 	default:
 		// Queue full (pathologically slow consumer): drop the oldest
 		// entry and retry once — the newest state is the one that
@@ -143,7 +176,7 @@ func (m *SSHManager) notifyStatus(forwardID, status string) {
 		default:
 		}
 		select {
-		case m.notifyCh <- notifyMsg{id: forwardID, status: status}:
+		case m.notifyCh <- notifyMsg{id: forwardID, status: status, terminal: terminal}:
 		default:
 		}
 	}
@@ -288,15 +321,16 @@ func KillProcessByPort(port int) error {
 
 	Logf("KillProcessByPort: found PID %s, attempting to kill", pid)
 
-	// Try kill without sudo first
+	// Unprivileged kill first; escalate through pkexec (graphical polkit
+	// prompt) for processes owned by root/other users. Plain `sudo` is
+	// useless in a GUI app: there is no terminal for the password prompt,
+	// so both sudo attempts always failed.
 	if err := exec.Command("kill", pid).Run(); err != nil {
-		Logf("KillProcessByPort: kill failed (no sudo): %v, trying with sudo", err)
-		// Try with sudo
-		if err := exec.Command("sudo", "kill", pid).Run(); err != nil {
-			Logf("KillProcessByPort: sudo kill also failed: %v", err)
-			// Try SIGKILL as last resort
-			if err := exec.Command("sudo", "kill", "-9", pid).Run(); err != nil {
-				return fmt.Errorf("failed to kill process %s (tried kill, sudo kill, sudo kill -9): %v", pid, err)
+		Logf("KillProcessByPort: plain kill failed: %v, escalating via pkexec", err)
+		if err := exec.Command("pkexec", "kill", pid).Run(); err != nil {
+			Logf("KillProcessByPort: pkexec kill failed: %v, trying SIGKILL", err)
+			if err := exec.Command("pkexec", "kill", "-9", pid).Run(); err != nil {
+				return fmt.Errorf("结束进程 %s 失败（已尝试 kill 与授权强杀）: %v", pid, err)
 			}
 		}
 	}
@@ -326,7 +360,7 @@ func killProcessByPortFallback(port int) error {
 			if err := exec.Command("kill", pid).Run(); err == nil {
 				return nil
 			}
-			if err := exec.Command("sudo", "kill", "-9", pid).Run(); err == nil {
+			if err := exec.Command("pkexec", "kill", "-9", pid).Run(); err == nil {
 				return nil
 			}
 		}
@@ -823,11 +857,22 @@ func (m *SSHManager) handleProcessExit(id string, err error, sshConn *SSHConn) {
 	}
 
 	sshConn.Status = status
-	m.notifyStatus(id, status)
+
+	// A reconnect follows only when classification allows it AND the
+	// config enables it. Only then is the failure transient for the
+	// user (the "连接中..." banner applies); otherwise the transition is
+	// terminal and must be surfaced right away — a first-connect failure
+	// in particular used to leave the banner stuck on "连接中...".
+	reconnectComing := shouldReconnect && sshConn.Config.AutoReconnect
+	if reconnectComing {
+		m.notifyStatus(id, status)
+	} else {
+		m.notifyTerminalStatus(id, status)
+	}
 
 	// Check if auto-reconnect is enabled. Consume the DDNSRestart flag
 	// here (under the lock) so the flag belongs to exactly one restart.
-	if shouldReconnect && sshConn.Config.AutoReconnect {
+	if reconnectComing {
 		ddnsTriggered := sshConn.DDNSRestart
 		sshConn.DDNSRestart = false
 		if ddnsTriggered {
@@ -972,10 +1017,11 @@ func (m *SSHManager) autoReconnect(id string, ddnsTriggered bool) {
 	// Surface the failure to the UI: notify the status transition so
 	// the render loop repaints with the disconnected state. Without
 	// this the user sees a stale "connecting" or last-known status.
+	// Terminal: retry budget exhausted, the UI must show the failure.
 	m.mu.Lock()
 	if c, ok := m.conns[id]; ok {
 		c.Status = "disconnected"
-		m.notifyStatus(id, "disconnected")
+		m.notifyTerminalStatus(id, "disconnected")
 	}
 	m.mu.Unlock()
 }

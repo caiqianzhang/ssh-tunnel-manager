@@ -102,8 +102,12 @@ type UI struct {
 	// conflictBusy is set true while a kill/change/ignore handler is
 	// running. We use it to swallow repeat clicks that would otherwise
 	// spawn duplicate SSH processes or double-kill the same PID.
-	conflictBusy   bool
-	connectBusy    bool
+	conflictBusy bool
+	connectBusy  bool
+	// zoneRefreshGen tokens zone-forward status refreshes: only the
+	// newest in-flight lookup may apply its result. Touched only on the
+	// UI thread.
+	zoneRefreshGen uint64
 	newPortEntry   widget.Editor
 	killProcessBtn widget.Clickable
 	changePortBtn  widget.Clickable
@@ -492,8 +496,9 @@ func (ui *UI) handleKillProcess() {
 			Logf("UI.handleKillProcess: kill failed: %v", err)
 			ui.queueUIFunc(func() {
 				ui.setTestResult(fmt.Sprintf("结束进程失败: %v", err), false)
-				ui.showPortConflictDialog = false
 				ui.conflictBusy = false
+				// Keep the dialog open: the user may retry the kill or
+				// switch to 更换端口 instead.
 			})
 			return
 		}
@@ -698,7 +703,13 @@ func (ui *UI) saveSettings() {
 		forwardType = "remote"
 	}
 
+	// Snapshots for rollback: the mutations below apply to the manager
+	// immediately (so the app keeps working during Save), and if Save
+	// fails we restore this state — otherwise the app would keep
+	// running on values that were never persisted.
 	forwards := ui.config.GetForwards()
+	prevAPIKey := ui.config.GetAPIKey()
+	prevDDNS := ui.config.GetDDNSCheckInterval()
 	var id string
 	var existing ForwardConfig
 	hadExisting := false
@@ -780,10 +791,21 @@ func (ui *UI) saveSettings() {
 	}
 
 	// Bug 5: report save failure to the user and keep them on the
-	// settings page so they can retry. Success transitions to main.
+	// settings page so they can retry. Roll back the in-memory state so
+	// the app doesn't keep running on values that failed to persist.
 	if err := ui.config.Save(); err != nil {
 		fmt.Println("Error saving config:", err)
 		Logf("UI.saveSettings: save error: %v", err)
+		ui.config.RestoreAppState(AppState{
+			Forwards: forwards,
+			Settings: AppSettings{APIKey: prevAPIKey, DDNSCheckInterval: prevDDNS},
+		})
+		if prevDDNS > 0 {
+			ui.ssh.SetDDNSCheckInterval(time.Duration(prevDDNS) * time.Second)
+		} else {
+			ui.ssh.SetDDNSCheckInterval(time.Duration(DefaultDDNSIntervalSeconds) * time.Second)
+		}
+		ui.loadConfigToForm()
 		ui.setTestResult(fmt.Sprintf("✗ 保存失败: %v", err), false)
 		return
 	}
@@ -858,6 +880,25 @@ func getFirstForwardID(cfg *ConfigManager) string {
 	return ""
 }
 
+// terminalFailureText maps a terminal tunnel status (no auto-reconnect
+// follows) to a user-facing failure banner. Empty for statuses that
+// carry no actionable meaning.
+func terminalFailureText(status string) string {
+	switch status {
+	case "auth_failed":
+		return "✗ 认证失败：请检查 SSH 用户名/密码（修改后保存会自动重启隧道）"
+	case "connection_refused":
+		return "✗ 连接被拒绝：远端 SSH 服务未响应"
+	case "port_in_use":
+		return "✗ 本地端口被占用"
+	case "unreachable":
+		return "✗ 无法到达服务器：请检查网络"
+	case "disconnected":
+		return "✗ 连接失败，自动重连已停止"
+	}
+	return ""
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  ZONE FORWARDING (域名解析优化)
 // ═══════════════════════════════════════════════════════════════
@@ -867,6 +908,11 @@ func getFirstForwardID(cfg *ConfigManager) string {
 // lookups for the current forward's domain. Results land on the UI
 // thread via queueUIFunc. No-op on unsupported systems.
 func (ui *UI) refreshZoneForwardStatusAsync() {
+	// Claim a refresh generation on the UI thread: a slow lookup for an
+	// OLD domain must not overwrite the result of a newer refresh (the
+	// goroutines race, and the old one can finish last).
+	ui.zoneRefreshGen++
+	gen := ui.zoneRefreshGen
 	forwards := ui.config.GetForwards()
 	go func() {
 		if !zoneForwardSupported() {
@@ -898,7 +944,7 @@ func (ui *UI) refreshZoneForwardStatusAsync() {
 				text = "未启用"
 				action, pending = "启用", zoneActionInstall
 			case !upToDate:
-				text = "有更新"
+				text = "需更新"
 				action, pending = "更新", zoneActionInstall
 			default:
 				text = "已启用"
@@ -906,6 +952,9 @@ func (ui *UI) refreshZoneForwardStatusAsync() {
 			}
 		}
 		ui.queueUIFunc(func() {
+			if ui.zoneRefreshGen != gen {
+				return // superseded by a newer refresh
+			}
 			ui.zoneSupported = true
 			ui.zoneStatusText = text
 			ui.zoneActionLabel = action

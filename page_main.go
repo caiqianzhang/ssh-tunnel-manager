@@ -127,18 +127,14 @@ func (ui *UI) updateHeroStatus() {
 	// Bug 2 / 18: clear stale test results when connection state
 	// changes. The "正在连接..." messages used to stick around forever
 	// because nobody told the UI when the connection finally succeeded.
+	// Failure states are NOT written here: terminal failures arrive via
+	// SetOnTerminalFailure with a friendly message, and transient ones
+	// (auto-reconnect in flight) must not be surfaced as errors.
 	if status != ui.lastShownStatus {
-		switch status {
-		case "running":
+		if status == "running" {
 			// Connection became healthy: clear any stale "connecting..."
 			// or error message so the user sees a clean status.
 			ui.setTestResult("", true)
-		case "disconnected", "port_in_use", "auth_failed", "connection_refused", "unreachable":
-			// If we were previously running and now we're in a stable
-			// error state, surface that to the user too.
-			if ui.lastShownStatus == "running" {
-				ui.setTestResult(fmt.Sprintf("连接已断开 (%s)", status), false)
-			}
 		}
 		ui.lastShownStatus = status
 	}

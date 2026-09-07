@@ -88,11 +88,19 @@ func encryptPassword(plaintext string) (string, error) {
 }
 
 // decryptPassword reverses encryptPassword. If cipherText is empty,
-// returns "" unchanged. If decryption fails, returns the input
-// verbatim so plaintext-on-disk configs (pre-encryption) keep working.
+// returns "" unchanged. Values that don't look like ciphertext (legacy
+// plaintext from pre-encryption configs) pass through unchanged; values
+// that DO look like ciphertext but fail validation return an error.
 func decryptPassword(cipherText string) (string, error) {
 	if cipherText == "" {
 		return "", nil
+	}
+	// Gate on the ciphertext shape (base64, at least nonce+tag bytes):
+	// without it, a legacy plaintext password that happens to be valid
+	// base64 (e.g. a 16-char alphanumeric string) would decode, fail GCM
+	// validation and take the whole config down with a read-only error.
+	if !IsEncrypted(cipherText) {
+		return cipherText, nil
 	}
 	key, err := loadOrCreateSecretKey()
 	if err != nil {
@@ -100,8 +108,7 @@ func decryptPassword(cipherText string) (string, error) {
 	}
 	raw, err := base64.StdEncoding.DecodeString(cipherText)
 	if err != nil {
-		// Likely legacy plaintext — return as-is so old configs still work.
-		return cipherText, nil
+		return "", fmt.Errorf("decrypt password: invalid base64: %w", err)
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -111,18 +118,13 @@ func decryptPassword(cipherText string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("new gcm: %w", err)
 	}
-	if len(raw) < gcm.NonceSize() {
-		// Not a valid ciphertext — treat as legacy plaintext.
-		return cipherText, nil
-	}
 	nonce := raw[:gcm.NonceSize()]
 	ct := raw[gcm.NonceSize():]
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
-		// Decryption failed — likely because the secret key changed
-		// or the ciphertext is corrupt. Return an error instead of
-		// silently passing garbage to SSH (which would surface as a
-		// confusing "Permission denied").
+		// Valid-shape ciphertext that won't open: the secret key changed
+		// or the data is corrupt — an error beats silently passing
+		// garbage to SSH (confusing "Permission denied").
 		return "", fmt.Errorf("decrypt password: GCM open failed (wrong key or corrupt data): %w", err)
 	}
 	return string(pt), nil

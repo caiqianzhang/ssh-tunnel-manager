@@ -79,12 +79,18 @@ func (cm *ConfigManager) Load() error {
 		return err
 	}
 
-	// Decrypt passwords in place so callers see plaintext.
+	// Decrypt passwords in place so callers see plaintext. One
+	// undecryptable field (lost/corrupt secret.key) must not take the
+	// whole config down — drop just that field and let the user re-enter
+	// it; the rest of the config stays usable.
 	for i := range state.Forwards {
 		if state.Forwards[i].SSHPassword != "" {
 			pt, err := decryptPassword(state.Forwards[i].SSHPassword)
 			if err != nil {
-				return fmt.Errorf("decrypt forward[%d] password: %w", i, err)
+				Logf("config: forward[%d] (%s) SSH password undecryptable: %v — clearing it, please re-enter",
+					i, state.Forwards[i].Name, err)
+				state.Forwards[i].SSHPassword = ""
+				continue
 			}
 			state.Forwards[i].SSHPassword = pt
 		}
@@ -94,9 +100,11 @@ func (cm *ConfigManager) Load() error {
 	if state.Settings.APIKey != "" {
 		pt, err := decryptPassword(state.Settings.APIKey)
 		if err != nil {
-			return fmt.Errorf("decrypt api key: %w", err)
+			Logf("config: API key undecryptable: %v — clearing it", err)
+			state.Settings.APIKey = ""
+		} else {
+			state.Settings.APIKey = pt
 		}
-		state.Settings.APIKey = pt
 	}
 
 	cm.state = *state
@@ -111,7 +119,7 @@ func (cm *ConfigManager) Save() error {
 	defer cm.mu.Unlock()
 
 	if cm.readOnly {
-		return fmt.Errorf("配置未能成功加载，已进入只读保护；请先修复配置文件，避免覆盖原数据")
+		return fmt.Errorf("配置加载失败，已进入只读保护；修复或删除配置文件后重启应用再保存（详见日志）")
 	}
 
 	// Build an encrypted copy so we don't mutate in-memory state.
@@ -274,6 +282,21 @@ func DefaultConfig() AppState {
 func (cm *ConfigManager) SetReadOnly(ro bool) {
 	cm.mu.Lock()
 	cm.readOnly = ro
+	cm.mu.Unlock()
+}
+
+// IsReadOnly reports whether read-only protection is active.
+func (cm *ConfigManager) IsReadOnly() bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.readOnly
+}
+
+// RestoreAppState replaces the in-memory state wholesale — the UI uses
+// it to roll back speculative mutations when Save fails.
+func (cm *ConfigManager) RestoreAppState(state AppState) {
+	cm.mu.Lock()
+	cm.state = state
 	cm.mu.Unlock()
 }
 
