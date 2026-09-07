@@ -31,11 +31,10 @@ jobs:
           - goos: windows
             goarch: amd64
             runner: windows-latest
-          # macos-latest is Apple Silicon; darwin/amd64 needs the Intel
-          # runner so CGO can find the x86_64 Cocoa SDK.
-          - goos: darwin
-            goarch: amd64
-            runner: macos-13
+          # macos-latest is Apple Silicon. The Intel macOS runner
+          # (macos-13) is deprecated and effectively unavailable on
+          # GitHub Actions, so only the arm64 build is produced; Intel
+          # Macs can run it through Rosetta 2.
           - goos: darwin
             goarch: arm64
             runner: macos-latest
