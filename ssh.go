@@ -226,12 +226,13 @@ func FlushDNS() error {
 }
 
 // dnsResolver is the DNS server used by ResolveHost when the Baidu DNS
-// fast-path is unavailable. It is a public resolver (default 8.8.8.8)
-// rather than the local system resolver: for DDNS hosts the local cache
-// is exactly what we are trying to bypass, so falling back to it would
-// silently defeat the purpose. Override via SetDNSResolver (set from
-// the settings page).
-var dnsResolver = "8.8.8.8"
+// fast-path is unavailable. It defaults to Baidu's public DNS
+// (119.29.29.29) rather than the local system resolver: for a domain
+// managed on Baidu Cloud DNS the local cache is exactly what we are
+// trying to bypass, and Baidu's own resolver is the natural
+// authoritative choice. Override via SetDNSResolver (set from the
+// settings page).
+var dnsResolver = "119.29.29.29"
 
 // SetDNSResolver configures the resolver used by ResolveHost. Pass an
 // empty string to fall back to the local system resolver.

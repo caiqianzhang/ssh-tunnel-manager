@@ -235,12 +235,12 @@ func (ui *UI) loadConfigToForm() {
 	}
 	ui.ddnsIntervalEntry.SetText(strconv.Itoa(interval))
 
-	// DNS resolver: show the configured value; default to Google DNS
-	// (8.8.8.8) when unset so the DDNS fallback does not use the stale
+	// DNS resolver: show the configured value; default to Baidu public DNS
+	// (119.29.29.29) when unset so the DDNS fallback does not use the stale
 	// local system resolver.
 	dnsResolver := ui.config.GetDNSResolver()
 	if dnsResolver == "" {
-		dnsResolver = "8.8.8.8"
+		dnsResolver = "119.29.29.29"
 	}
 	ui.dnsResolverEntry.SetText(dnsResolver)
 }
