@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/publicsuffix"
+
 	"github.com/ssh-tunnel-manager/ssh-tunnel-manager/internal/bcd"
 )
 
@@ -30,30 +32,15 @@ import (
 // (not const) so tests can point QueryBaiduDNSIP at a mock server.
 // Access is guarded by baiduBaseMu.
 var (
-	baiduDNSAPIBase = "https://bcd.baidubce.com"
+	baiduDNSAPIBase = bcd.BaseURL
 	baiduBaseMu     sync.RWMutex
 )
-
-// sharedHTTPClient reuses connections across Baidu DNS API calls.
-// QueryBaiduDNSIP runs in the DDNS heartbeat goroutine (every 15s) and
-// on each SSH connect, so a pooled client avoids a fresh TCP/TLS
-// handshake on every call.
-var sharedHTTPClient = &http.Client{
-	Timeout: 10 * time.Second,
-}
 
 // baiduAPIBase returns the current API base URL.
 func baiduAPIBase() string {
 	baiduBaseMu.RLock()
 	defer baiduBaseMu.RUnlock()
 	return baiduDNSAPIBase
-}
-
-// setBaiduAPIBase overrides the API base URL. Used by tests.
-func setBaiduAPIBase(url string) {
-	baiduBaseMu.Lock()
-	baiduDNSAPIBase = url
-	baiduBaseMu.Unlock()
 }
 
 // Cached Baidu credentials, loaded once at startup.
@@ -75,7 +62,8 @@ func InitBaiduDNS() {
 	}
 	ak, sk, err := bcd.LoadCredentials(path)
 	if err != nil {
-		Logf("Baidu DNS: failed to load credentials from %s: %v", path, err)
+		// LoadCredentials' error already quotes the path; don't repeat it.
+		Logf("Baidu DNS: %v", err)
 		return
 	}
 	baiduMu.Lock()
@@ -125,17 +113,15 @@ type DnsTarget struct {
 	AccessKey string
 	SecretKey string
 	Zone      string
-	Sub       string
 	APIBase   string
 }
 
 // NewDnsTarget creates a DnsTarget with the given credentials and zone.
-func NewDnsTarget(accessKey, secretKey, zone, sub, apiBase string) *DnsTarget {
+func NewDnsTarget(accessKey, secretKey, zone, apiBase string) *DnsTarget {
 	return &DnsTarget{
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		Zone:      zone,
-		Sub:       sub,
 		APIBase:   strings.TrimSuffix(apiBase, "/"),
 	}
 }
@@ -144,17 +130,22 @@ func NewDnsTarget(accessKey, secretKey, zone, sub, apiBase string) *DnsTarget {
 // JSON records of the whole zone. Results are paginated (pageSize 100):
 // a zone with more records than one page would otherwise silently hide
 // its later entries — exactly the A record this feature needs.
-func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) {
-	path := "/v1/domain/resolve/list"
+func (d *DnsTarget) listRecords() ([]json.RawMessage, error) {
 	const pageSize = 100
 	const maxPages = 10 // 1000 records — plenty for a DDNS zone, and a
 	//                    hard stop against a misbehaving API.
+
+	// path and its canonical form are constant across the pagination
+	// loop; compute them once instead of re-canonicalizing per page.
+	path := "/v1/domain/resolve/list"
+	canonicalURI := bcd.CanonicalURI(path)
+	url := d.APIBase + canonicalURI
 
 	var all []json.RawMessage
 	for pageNo := 1; pageNo <= maxPages; pageNo++ {
 		body := fmt.Sprintf(`{"domain":%q,"pageNo":%d,"pageSize":%d}`, d.Zone, pageNo, pageSize)
 
-		req, err := http.NewRequest("POST", d.APIBase+bcd.CanonicalURI(path), strings.NewReader(body))
+		req, err := http.NewRequest("POST", url, strings.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create DNS request: %w", err)
 		}
@@ -162,9 +153,15 @@ func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) 
 		now := time.Now().UTC()
 		req.Header.Set("Authorization", bcd.SignRequest(d.AccessKey, d.SecretKey, "POST", path, now))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		req.Header.Set("Host", "bcd.baidubce.com")
+		req.Header.Set("Host", bcd.Host)
 
-		resp, err := client.Do(req)
+		// A fresh client per call: QueryBaiduDNSIP runs in the DDNS
+		// heartbeat goroutine (every 15s) and on each SSH connect, but
+		// http.DefaultTransport (the fallback when Transport is nil) is
+		// already a process-global pooled transport, so an explicit
+		// client here buys no extra connection reuse — it only adds a
+		// mutable package-global for callers to trip over.
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("请求百度云 DNS %s 失败: %w", path, err)
 		}
@@ -186,7 +183,7 @@ func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) 
 		}
 
 		// Some endpoints (e.g. edit) return an empty body on success.
-		if strings.TrimSpace(string(respBody)) == "" {
+		if len(respBody) == 0 {
 			break
 		}
 
@@ -218,11 +215,8 @@ func QueryBaiduDNSIP(accessKey, secretKey, zone, sub string) (string, error) {
 // explicit API base URL. It exists so tests can point at a mock server
 // without touching the production constant.
 func QueryBaiduDNSIPWithBase(accessKey, secretKey, zone, sub, apiBase string) (string, error) {
-	// Reuse a pooled client: QueryBaiduDNSIP runs in the DDNS heartbeat
-	// goroutine (every 15s) and on each SSH connect, so a fresh client
-	// per call pays a needless TCP/TLS handshake every time.
-	target := NewDnsTarget(accessKey, secretKey, zone, sub, apiBase)
-	records, err := target.listRecords(sharedHTTPClient)
+	target := NewDnsTarget(accessKey, secretKey, zone, apiBase)
+	records, err := target.listRecords()
 	if err != nil {
 		return "", err
 	}
@@ -272,25 +266,12 @@ func ResolveRealIP(host string) (ip string, ok bool) {
 	return ip, true
 }
 
-// multiPartTLDs are common two-label public suffixes (registry-managed
-// second-level domains). For hosts under these, the registrable zone is
-// three labels, not two — "www.bbc.co.uk" belongs to zone "bbc.co.uk",
-// not "co.uk". Not exhaustive: it covers the suffixes a DDNS user is
-// realistically on; anything else falls back to the two-label rule.
-var multiPartTLDs = map[string]bool{
-	"co.uk": true, "org.uk": true, "ac.uk": true, "gov.uk": true, "me.uk": true,
-	"com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true,
-	"com.hk": true, "org.hk": true, "com.tw": true, "org.tw": true,
-	"com.jp": true, "ne.jp": true, "or.jp": true, "co.jp": true,
-	"com.kr": true, "co.kr": true, "or.kr": true,
-	"com.au": true, "net.au": true, "org.au": true,
-	"com.sg": true, "com.br": true, "com.mx": true, "com.ar": true,
-	"com.tr": true, "co.in": true, "co.nz": true, "co.za": true,
-}
-
-// deriveZoneAndSub splits a hostname into zone (registered domain) and
-// subdomain. Heuristic: the zone is the last two labels — or the last
-// three when they end in a known two-label public suffix.
+// deriveZoneAndSub splits a hostname into zone (registrable domain) and
+// subdomain, using the public suffix list rather than a hand-rolled
+// table. A hand-rolled table silently misclassifies any suffix it omits
+// (e.g. "ac.nz", "co.id"), producing a zone that is not a registrable
+// domain and causing the Baidu API query to target a nonexistent zone
+// — the DDNS fast-path then silently falls back to ordinary DNS.
 //
 //	"www.example.com"  -> zone="example.com",       sub="www"
 //	"example.com"      -> zone="example.com",       sub="@"
@@ -298,22 +279,18 @@ var multiPartTLDs = map[string]bool{
 //	"www.bbc.co.uk"    -> zone="bbc.co.uk",         sub="www"
 //	"site.co.uk"       -> zone="site.co.uk",        sub="@"
 func deriveZoneAndSub(host string) (zone, sub string) {
-	// Normalize: the suffix table and the API's record-name match are
-	// case-sensitive, and a trailing dot would corrupt the label split.
+	// Normalize: case-insensitive, and a trailing dot would corrupt the
+	// label split (EffectiveTLDPlusOne rejects empty labels).
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	labels := strings.Split(host, ".")
-	if len(labels) < 2 {
+
+	zone, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil {
+		// Single-label host (e.g. "localhost") or an IP literal: there
+		// is no registrable domain, so treat the whole host as the zone.
 		return host, "@"
 	}
-	n := 2
-	if len(labels) >= 3 && multiPartTLDs[strings.Join(labels[len(labels)-2:], ".")] {
-		n = 3
+	if host == zone {
+		return zone, "@"
 	}
-	zone = strings.Join(labels[len(labels)-n:], ".")
-	if len(labels) == n {
-		sub = "@"
-	} else {
-		sub = strings.Join(labels[:len(labels)-n], ".")
-	}
-	return zone, sub
+	return zone, strings.TrimSuffix(host, "."+zone)
 }

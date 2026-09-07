@@ -15,8 +15,15 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
+
+// Host is the Baidu Cloud BCD API host. It is exported so the request
+// construction (Host header) and the signing canonical string share one
+// source of truth instead of each caller hardcoding the literal.
+const Host = "bcd.baidubce.com"
+
+// BaseURL is the Baidu Cloud BCD API endpoint.
+const BaseURL = "https://" + Host
 
 // SignExpiration is the BCE Auth V1 signature validity window (seconds).
 const SignExpiration = "1800"
@@ -51,13 +58,13 @@ func CanonicalURI(path string) string {
 //
 // Signing key derivation:
 //  1. signing_key = HMAC-SHA256(SK, "bce-auth-v1/{AK}/{timestamp}/{expiration}")
-//  2. signature   = HMAC-SHA256(signing_key, "{METHOD}\n{uri}\n\nhost:bcd.baidubce.com")
+//  2. signature   = HMAC-SHA256(signing_key, "{METHOD}\n{uri}\n\nhost:{Host}")
 //
 // The request body is NOT part of the canonical string.
 func SignRequest(accessKey, secretKey, method, path string, now time.Time) string {
 	timestamp := now.Format("2006-01-02T15:04:05Z")
 	prefix := fmt.Sprintf("bce-auth-v1/%s/%s/%s", accessKey, timestamp, SignExpiration)
-	canonical := fmt.Sprintf("%s\n%s\n\nhost:bcd.baidubce.com", method, CanonicalURI(path))
+	canonical := fmt.Sprintf("%s\n%s\n\nhost:%s", method, CanonicalURI(path), Host)
 
 	mac := hmac.New(sha256.New, []byte(secretKey))
 	mac.Write([]byte(prefix))
@@ -89,24 +96,19 @@ func LoadCredentials(path string) (ak, sk string, err error) {
 		if line == "" {
 			continue
 		}
-		// Handle both Chinese "：" (U+FF1A, 3 bytes in UTF-8) and ASCII ":".
-		var key, value string
-		if idx := strings.Index(line, "："); idx >= 0 {
-			key = strings.TrimSpace(line[:idx])
-			_, size := utf8.DecodeRuneInString(line[idx:])
-			value = strings.TrimSpace(line[idx+size:])
-		} else if idx := strings.Index(line, ":"); idx >= 0 {
-			key = strings.TrimSpace(line[:idx])
-			value = strings.TrimSpace(line[idx+1:])
-		} else {
+		// Normalize the Chinese full-width colon to ASCII so the rest of
+		// the parsing is a single code path.
+		line = strings.ReplaceAll(line, "：", ":")
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
 			continue
 		}
 
-		switch strings.ToLower(key) {
+		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "key", "ak":
-			ak = value
+			ak = strings.TrimSpace(value)
 		case "secret", "sk":
-			sk = value
+			sk = strings.TrimSpace(value)
 		}
 	}
 

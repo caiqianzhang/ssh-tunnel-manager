@@ -52,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiBase := "https://bcd.baidubce.com"
+	apiBase := bcd.BaseURL
 
 	client := &http.Client{
 		Timeout: 15 * time.Second,
@@ -63,9 +63,24 @@ func main() {
 
 	// Query ALL records for the domain
 	path := "/v1/domain/resolve/list"
-	body := fmt.Sprintf(`{"domain":%q,"pageNo":1,"pageSize":100}`, zone)
+	url := apiBase + bcd.CanonicalURI(path)
 
-	req, err := http.NewRequest("POST", apiBase+bcd.CanonicalURI(path), strings.NewReader(body))
+	// Marshal the domain value with json.Marshal rather than fmt %q: %q
+	// applies Go string escaping (\xNN), which is not valid JSON, so a
+	// zone containing a raw control byte or invalid UTF-8 byte would
+	// produce a body the API rejects as HTTP 400.
+	bodyBytes, err := json.Marshal(map[string]interface{}{
+		"domain":  zone,
+		"pageNo":  1,
+		"pageSize": 100,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "querydns: marshal request body: %v\n", err)
+		os.Exit(1)
+	}
+	body := string(bodyBytes)
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(body))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "querydns: create request: %v\n", err)
 		os.Exit(1)
@@ -74,10 +89,11 @@ func main() {
 	now := time.Now().UTC()
 	req.Header.Set("Authorization", bcd.SignRequest(ak, sk, "POST", path, now))
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Host", "bcd.baidubce.com")
+	req.Header.Set("Host", bcd.Host)
 
-	fmt.Printf("=== Request ===\nPOST %s\nBody: %s\n\n",
-		apiBase+bcd.CanonicalURI(path), body)
+	// Request context goes to stderr: it is debugging scaffolding, not
+	// the data a piping consumer reads.
+	fmt.Fprintf(os.Stderr, "=== Request ===\nPOST %s\nBody: %s\n\n", url, body)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -91,9 +107,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "querydns: read response: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("=== Response (HTTP %d) ===\n%s\n", resp.StatusCode, string(respBody))
 
-	// Parse and display records
+	// Non-2xx is an API error, not a result set: report it on stderr so a
+	// wrapper that captures stdout (output=$(querydns ...)) does not get
+	// Baidu's error envelope mixed into the record list.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Fprintf(os.Stderr, "=== Response (HTTP %d) ===\n%s\n", resp.StatusCode, string(respBody))
+		os.Exit(1)
+	}
+
+	// Parse and display records.
 	var payload struct {
 		Result []json.RawMessage `json:"result"`
 	}
@@ -102,7 +125,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n=== Records (%d) ===\n", len(payload.Result))
+	fmt.Printf("=== Records (%d) ===\n", len(payload.Result))
 	for i, r := range payload.Result {
 		var rec struct {
 			RecordID int    `json:"recordId"`

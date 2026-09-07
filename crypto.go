@@ -131,8 +131,6 @@ func decryptPassword(cipherText string) (string, error) {
 
 // IsEncrypted reports whether cipherText looks like an encrypted
 // password (base64 with at least nonce + 16-byte AES-GCM tag length).
-const minCiphertextLen = 28 // 12-byte GCM nonce + 16-byte auth tag
-
 func IsEncrypted(cipherText string) bool {
 	if cipherText == "" {
 		return false
@@ -144,4 +142,8 @@ func IsEncrypted(cipherText string) bool {
 	// AES-GCM with 12-byte nonce = minimum 28 bytes ciphertext.
 	return len(raw) >= minCiphertextLen
 }
+
+// minCiphertextLen is the shortest valid AES-GCM ciphertext: 12-byte nonce
+// plus 16-byte auth tag.
+const minCiphertextLen = 28
 

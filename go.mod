@@ -5,6 +5,7 @@ go 1.26.6
 require (
 	fyne.io/systray v1.12.2
 	gioui.org v0.10.2
+	golang.org/x/net v0.48.0
 )
 
 // Vendored copy with a one-line fix for the wayland clipboard-read wedge:
@@ -19,7 +20,6 @@ require (
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/image v0.26.0 // indirect
-	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 )
