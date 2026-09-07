@@ -937,19 +937,20 @@ func (m *SSHManager) autoReconnect(id string, ddnsTriggered bool) {
 		}
 
 		// Start succeeded — publish the new process and status. Re-check
-		// existence under the lock first: the StopCh check above is not
-		// atomic with this store, so Disconnect may have closed StopCh and
-		// removed the conn while we were starting. Publishing anyway would
-		// re-add an orphan tunnel (or a stuck "connecting" conn with a
-		// dead process) and silently undo the user's disconnect.
+		// under the lock, and by IDENTITY: restartWithConfig (save
+		// settings while a tunnel exists) swaps in a brand-new conn
+		// under the same ID while this in-flight reconnect was starting.
+		// An existence-only check would publish into the replaced slot —
+		// mutating a dead conn, attaching a second monitor to the new
+		// tunnel and emitting a spurious "connecting".
 		m.mu.Lock()
-		if _, exists := m.conns[id]; !exists {
+		if cur, exists := m.conns[id]; !exists || cur != sshConn {
 			m.mu.Unlock()
 			if cmd.Process != nil {
 				_ = cmd.Process.Kill()
 			}
 			_ = cmd.Wait()
-			Logf("autoReconnect: conn %s removed during start, aborting", id)
+			Logf("autoReconnect: conn %s removed or replaced during start, aborting", id)
 			return
 		}
 		sshConn.Process = cmd

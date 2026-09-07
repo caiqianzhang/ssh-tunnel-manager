@@ -811,8 +811,16 @@ func (ui *UI) saveSettings() {
 // restartWithConfig cleanly replaces an existing tunnel with one built
 // from the just-saved config. Runs off the UI thread; feedback goes
 // through setTestResult (thread-safe) and queueUIFunc for widget state.
+// Holds connectBusy for the whole section so clicks on 连接 (and repeat
+// saves) cannot race this goroutine's Connect.
 func (ui *UI) restartWithConfig(fwd ForwardConfig) {
+	if ui.connectBusy {
+		return
+	}
+	ui.connectBusy = true
 	go func() {
+		defer ui.queueUIFunc(func() { ui.connectBusy = false })
+
 		_ = ui.ssh.Disconnect(fwd.ID)
 
 		// Wait for the old ssh process to release the local port (it

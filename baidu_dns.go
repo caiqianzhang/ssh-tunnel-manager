@@ -391,6 +391,9 @@ var multiPartTLDs = map[string]bool{
 //	"www.bbc.co.uk"    -> zone="bbc.co.uk",         sub="www"
 //	"site.co.uk"       -> zone="site.co.uk",        sub="@"
 func deriveZoneAndSub(host string) (zone, sub string) {
+	// Normalize: the suffix table and the API's record-name match are
+	// case-sensitive, and a trailing dot would corrupt the label split.
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	labels := strings.Split(host, ".")
 	if len(labels) < 2 {
 		return host, "@"

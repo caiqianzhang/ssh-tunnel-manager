@@ -97,6 +97,14 @@ func (ui *UI) titleBarBtn(btn *widget.Clickable, glyph string, danger bool) layo
 
 			defer clip.UniformRRect(image.Rect(0, 0, sz, sz), 8).Push(gtx.Ops).Pop()
 			paint.Fill(gtx.Ops, bg)
+			// Mask this area from the bar-wide ActionMove surface: the
+			// drag area is an ANCESTOR of this clip (the bar clip spans
+			// the whole Stack), and Gio's hit-testing only prunes
+			// sibling subtrees — without a non-move action claimed here,
+			// pressing the button starts a window drag on every
+			// platform. Matches upstream material.Decorations, which
+			// adds an ActionInputOp per decoration button.
+			system.ActionInputOp(system.ActionRaise).Add(gtx.Ops)
 			layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				lbl := material.Body2(ui.theme, glyph)
 				lbl.Color = fg
