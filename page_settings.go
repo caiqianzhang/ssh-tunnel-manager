@@ -84,9 +84,6 @@ func (ui *UI) settingsSaveBtn(gtx layout.Context) layout.Dimensions {
 
 // ═══════════════════════════════════════════════════════════════
 //  SHARED DRAWING HELPERS
-
-// ═══════════════════════════════════════════════════════════════
-//  SHARED DRAWING HELPERS
 // ═══════════════════════════════════════════════════════════════
 
 // drawSection renders a titled section: a small secondary-color label
@@ -184,8 +181,6 @@ func (ui *UI) drawRoundedBtn(gtx layout.Context, btn *widget.Clickable, text str
 
 // ─── Scrollable Container with Visible Scrollbar ─────────────────
 
-// ─── Scrollable Container with Visible Scrollbar ─────────────────
-
 // ScrollableState holds the state for a scrollable container with scrollbar.
 type ScrollableState struct {
 	list widget.List
@@ -215,17 +210,6 @@ func LayoutScrollable(gtx layout.Context, theme *material.Theme, state *Scrollab
 	return listStyle.Layout(gtx, 1, func(gtx layout.Context, _ int) layout.Dimensions {
 		return content(gtx)
 	})
-}
-
-// clampInt constrains v to [lo, hi].
-func clampInt(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
 
 // zoneForwardRow renders the 域名解析优化 feature row. Returns zero

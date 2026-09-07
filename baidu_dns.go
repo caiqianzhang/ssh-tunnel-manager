@@ -1,9 +1,6 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,12 +11,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+
+	"github.com/ssh-tunnel-manager/ssh-tunnel-manager/internal/bcd"
 )
 
 // Baidu Cloud DNS (BCD) API integration.
 //
-// Ported from baidu_dns.rs (Rust reference). Provides fast IP resolution
+// Ported from the Rust reference (docs/reference/baidu_dns.rs). Provides fast IP resolution
 // for the DDNS scenario: when the server's IP changes, the Baidu DNS API
 // returns the current IP immediately, bypassing DNS propagation delay
 // (which is bounded by the record TTL).
@@ -50,9 +48,6 @@ func setBaiduAPIBase(url string) {
 	baiduBaseMu.Unlock()
 }
 
-// signExpiration is the BCE Auth V1 signature validity window (seconds).
-const signExpiration = "1800"
-
 // Cached Baidu credentials, loaded once at startup.
 var (
 	baiduAK string
@@ -70,7 +65,7 @@ func InitBaiduDNS() {
 		Logf("Baidu DNS: baidu.key not found, API integration disabled")
 		return
 	}
-	ak, sk, err := LoadBaiduCredentials(path)
+	ak, sk, err := bcd.LoadCredentials(path)
 	if err != nil {
 		Logf("Baidu DNS: failed to load credentials from %s: %v", path, err)
 		return
@@ -117,104 +112,6 @@ func findBaiduKey() (string, error) {
 	return "", fmt.Errorf("baidu.key not found")
 }
 
-// LoadBaiduCredentials reads AK/SK from a baidu.key file.
-//
-// Expected format (one per line, Chinese or ASCII colon):
-//
-//	Secret：<your_secret_key>
-//	key：<your_access_key>
-//
-// where "key" maps to AK and "Secret" maps to SK. Never put real
-// credentials in this comment — they live only in the git-ignored
-// baidu.key file.
-func LoadBaiduCredentials(path string) (ak, sk string, err error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", fmt.Errorf("read baidu.key: %w", err)
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// Handle both Chinese "：" (U+FF1A, 3 bytes in UTF-8) and ASCII ":".
-		var key, value string
-		if idx := strings.Index(line, "："); idx >= 0 {
-			key = strings.TrimSpace(line[:idx])
-			_, size := utf8.DecodeRuneInString(line[idx:])
-			value = strings.TrimSpace(line[idx+size:])
-		} else if idx := strings.Index(line, ":"); idx >= 0 {
-			key = strings.TrimSpace(line[:idx])
-			value = strings.TrimSpace(line[idx+1:])
-		} else {
-			continue
-		}
-
-		switch strings.ToLower(key) {
-		case "key", "ak":
-			ak = value
-		case "secret", "sk":
-			sk = value
-		}
-	}
-
-	if ak == "" || sk == "" {
-		return "", "", fmt.Errorf("baidu.key missing AK or SK")
-	}
-	return ak, sk, nil
-}
-
-// canonicalURI percent-encodes path segments for BCE Auth V1 signing.
-// Mirrors the Rust canonical_uri: strips empty segments, encodes each
-// byte that is not unreserved (ALPHA / DIGIT / "-" / "_" / "." / "~").
-func canonicalURI(path string) string {
-	var parts []string
-	for _, seg := range strings.Split(path, "/") {
-		if seg == "" {
-			continue
-		}
-		var out strings.Builder
-		for _, b := range []byte(seg) {
-			if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-				(b >= '0' && b <= '9') ||
-				b == '-' || b == '_' || b == '.' || b == '~' {
-				out.WriteByte(b)
-			} else {
-				out.WriteString(fmt.Sprintf("%%%02X", b))
-			}
-		}
-		parts = append(parts, out.String())
-	}
-	return "/" + strings.Join(parts, "/")
-}
-
-// signRequest generates a BCE Auth V1 Authorization header value.
-//
-// Scheme: bce-auth-v1/{AK}/{timestamp}/{expiration}/host/{signature}
-//
-// Signing key derivation:
-//  1. signing_key = HMAC-SHA256(SK, "bce-auth-v1/{AK}/{timestamp}/{expiration}")
-//  2. signature   = HMAC-SHA256(signing_key, "{METHOD}\n{uri}\n\nhost:bcd.baidubce.com")
-//
-// The request body is NOT part of the canonical string (matches the
-// Rust reference and the Baidu API specification).
-func signRequest(accessKey, secretKey, method, path string, now time.Time) string {
-	timestamp := now.Format("2006-01-02T15:04:05Z")
-	prefix := fmt.Sprintf("bce-auth-v1/%s/%s/%s", accessKey, timestamp, signExpiration)
-	canonical := fmt.Sprintf("%s\n%s\n\nhost:bcd.baidubce.com", method, canonicalURI(path))
-
-	mac := hmac.New(sha256.New, []byte(secretKey))
-	mac.Write([]byte(prefix))
-	signingKey := hex.EncodeToString(mac.Sum(nil))
-
-	mac2 := hmac.New(sha256.New, []byte(signingKey))
-	mac2.Write([]byte(canonical))
-	signature := hex.EncodeToString(mac2.Sum(nil))
-
-	return fmt.Sprintf("%s/host/%s", prefix, signature)
-}
-
 // DnsTarget holds Baidu DNS API credentials and the target zone.
 type DnsTarget struct {
 	AccessKey string
@@ -249,13 +146,13 @@ func (d *DnsTarget) listRecords(client *http.Client) ([]json.RawMessage, error) 
 	for pageNo := 1; pageNo <= maxPages; pageNo++ {
 		body := fmt.Sprintf(`{"domain":%q,"pageNo":%d,"pageSize":%d}`, d.Zone, pageNo, pageSize)
 
-		req, err := http.NewRequest("POST", d.APIBase+canonicalURI(path), strings.NewReader(body))
+		req, err := http.NewRequest("POST", d.APIBase+bcd.CanonicalURI(path), strings.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create DNS request: %w", err)
 		}
 
 		now := time.Now().UTC()
-		req.Header.Set("Authorization", signRequest(d.AccessKey, d.SecretKey, "POST", path, now))
+		req.Header.Set("Authorization", bcd.SignRequest(d.AccessKey, d.SecretKey, "POST", path, now))
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		req.Header.Set("Host", "bcd.baidubce.com")
 

@@ -25,10 +25,6 @@ func (ui *UI) layoutMainPage(gtx layout.Context) layout.Dimensions {
 	return ui.mainContent(gtx)
 }
 
-// drawCard paints a rounded card behind content, sized exactly to the
-// measured content. Never size card fills from Constraints.Max: inside
-// a scrollable List the main axis is unbounded and the fill would
-
 func (ui *UI) mainContent(gtx layout.Context) layout.Dimensions {
 	// When the settings section is expanded the content no longer fits
 	// the compact window, so the whole page becomes scrollable.

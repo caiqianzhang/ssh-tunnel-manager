@@ -4,6 +4,9 @@ build/
 ssh-tunnel-manager
 ssh-tunnel-manager-linux
 ssh-tunnel-manager.exe
+querydns
+querydns-linux
+querydns.exe
 
 # Runtime files (generated, never commit)
 ssh-tunnel-manager.log

@@ -5,7 +5,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -144,6 +143,3 @@ func IsEncrypted(cipherText string) bool {
 	return len(raw) >= 28
 }
 
-var (
-	ErrEmptyCipher = errors.New("empty cipher text")
-)

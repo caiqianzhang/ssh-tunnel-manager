@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ssh-tunnel-manager/ssh-tunnel-manager/internal/bcd"
 )
 
 // ---------- canonicalURI ----------
@@ -51,9 +53,9 @@ func TestCanonicalURI(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := canonicalURI(tt.in)
+			got := bcd.CanonicalURI(tt.in)
 			if got != tt.want {
-				t.Errorf("canonicalURI(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Errorf("bcd.CanonicalURI(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -63,14 +65,14 @@ func TestCanonicalURI(t *testing.T) {
 
 // signRequestVector is the expected Authorization header value for
 // AK-test/SK-test, POST /v1/domain/resolve/list at 2026-09-03T00:00:00Z.
-// Cross-checked against the Rust reference (baidu_dns.rs) and the Python
-// reference implementation (baidu_dns.py).
+// Cross-checked against the Rust reference (docs/reference/baidu_dns.rs)
+// and the Python reference implementation (baidu_dns.py).
 const signRequestVector = "bce-auth-v1/AK-test/2026-09-03T00:00:00Z/1800/host/" +
 	"a00258c153b0f641b659621076d3133ca6950608606eff1d7729b7e2332a5d85"
 
 func TestSignRequestMatchesReferenceVector(t *testing.T) {
 	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	got := signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
+	got := bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
 	if got != signRequestVector {
 		t.Errorf("signRequest mismatch:\n  got:  %s\n  want: %s", got, signRequestVector)
 	}
@@ -80,8 +82,8 @@ func TestSignRequestMatchesReferenceVector(t *testing.T) {
 // identical inputs (no randomness in the signing path).
 func TestSignRequestDeterministic(t *testing.T) {
 	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	a := signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
-	b := signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
+	a := bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
+	b := bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
 	if a != b {
 		t.Errorf("signRequest is not deterministic: %q vs %q", a, b)
 	}
@@ -91,23 +93,23 @@ func TestSignRequestDeterministic(t *testing.T) {
 // produces a different signature (catches copy-paste bugs).
 func TestSignRequestDifferentiatesInputs(t *testing.T) {
 	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	base := signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
+	base := bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
 
 	cases := []struct {
 		name string
 		got  string
 	}{
-		{"different AK", signRequest("AK-other", "SK-test", "POST", "/v1/domain/resolve/list", now)},
-		{"different SK", signRequest("AK-test", "SK-other", "POST", "/v1/domain/resolve/list", now)},
-		{"different method", signRequest("AK-test", "SK-test", "GET", "/v1/domain/resolve/list", now)},
-		{"different path", signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list/foo", now)},
-		{"different time", signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list",
+		{"different AK", bcd.SignRequest("AK-other", "SK-test", "POST", "/v1/domain/resolve/list", now)},
+		{"different SK", bcd.SignRequest("AK-test", "SK-other", "POST", "/v1/domain/resolve/list", now)},
+		{"different method", bcd.SignRequest("AK-test", "SK-test", "GET", "/v1/domain/resolve/list", now)},
+		{"different path", bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list/foo", now)},
+		{"different time", bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list",
 			now.Add(time.Second))},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if c.got == base {
-				t.Errorf("signRequest(%s) == base, expected different signature", c.name)
+				t.Errorf("bcd.SignRequest(%s) == base, expected different signature", c.name)
 			}
 		})
 	}
@@ -117,7 +119,7 @@ func TestSignRequestDifferentiatesInputs(t *testing.T) {
 // are always present in the returned Authorization header.
 func TestSignRequestPrefix(t *testing.T) {
 	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
-	got := signRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
+	got := bcd.SignRequest("AK-test", "SK-test", "POST", "/v1/domain/resolve/list", now)
 	if !strings.HasPrefix(got, "bce-auth-v1/AK-test/") {
 		t.Errorf("signRequest missing expected prefix, got %q", got)
 	}
