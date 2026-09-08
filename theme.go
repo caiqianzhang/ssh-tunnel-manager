@@ -35,14 +35,11 @@ var (
 	ColorGreen      = color.NRGBA{R: 0x34, G: 0xD3, B: 0x99, A: 255}
 	ColorGreenBg    = color.NRGBA{R: 0x34, G: 0xD3, B: 0x99, A: 31}
 	ColorYellow     = color.NRGBA{R: 0xFB, G: 0xBF, B: 0x24, A: 255}
-	ColorYellowBg   = color.NRGBA{R: 0xFB, G: 0xBF, B: 0x24, A: 31}
 	ColorGray       = color.NRGBA{R: 0x6B, G: 0x72, B: 0x80, A: 255}
 	ColorGrayBg     = color.NRGBA{R: 0x6B, G: 0x72, B: 0x80, A: 26}
 	ColorDanger     = color.NRGBA{R: 0xF8, G: 0x71, B: 0x71, A: 255}
 	ColorDangerDark = color.NRGBA{R: 0xE1, G: 0x5B, B: 0x5B, A: 255}
 	ColorDangerBg   = color.NRGBA{R: 0xF8, G: 0x71, B: 0x71, A: 31}
-
-	// Misc
 )
 
 func drawCard(gtx layout.Context, radius int, bg color.NRGBA, content layout.Widget) layout.Dimensions {

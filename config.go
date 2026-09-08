@@ -34,10 +34,29 @@ type ForwardConfig struct {
 // overridden per config (settings.ddns_check_interval, seconds).
 const DefaultDDNSIntervalSeconds = 15
 
-// AppState represents the entire application configuration state
+// AppState represents the entire application configuration state.
+//
+// The app manages exactly ONE forwarding rule. Forwards is the legacy
+// multi-forward field: it is read for compatibility with older configs
+// (the first entry migrates into Forward) and never written back.
 type AppState struct {
-	Forwards []ForwardConfig `json:"forwards"`
-	Settings AppSettings     `json:"settings"`
+	Forward  *ForwardConfig `json:"forward,omitempty"`
+	Settings AppSettings    `json:"settings"`
+	// Forwards is legacy-only; see normalizeLegacy. Always nil after
+	// Load/Save.
+	Forwards []ForwardConfig `json:"forwards,omitempty"`
+}
+
+// normalizeLegacy migrates the legacy multi-forward layout: the first
+// entry becomes the app's single forward and the slice is dropped, so
+// a config loaded and re-saved by any version of the app comes out in
+// the current shape.
+func (s *AppState) normalizeLegacy() {
+	if s.Forward == nil && len(s.Forwards) > 0 {
+		f := s.Forwards[0]
+		s.Forward = &f
+	}
+	s.Forwards = nil
 }
 
 // AppSettings holds application-level settings
@@ -69,12 +88,13 @@ type ConfigManager struct {
 func NewConfigManager(filePath string) *ConfigManager {
 	return &ConfigManager{
 		filePath: filePath,
-		state:    AppState{Forwards: []ForwardConfig{}},
+		state:    AppState{},
 	}
 }
 
-// Load loads the configuration from the JSON file. Decrypts any
-// SSHPassword fields that are stored in ciphertext form.
+// Load loads the configuration from the JSON file. Decrypts the stored
+// SSH password if present. Legacy multi-forward configs are migrated
+// to the single-forward shape on the way in (first entry wins).
 func (cm *ConfigManager) Load() error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -84,20 +104,18 @@ func (cm *ConfigManager) Load() error {
 		return err
 	}
 
-	// Decrypt passwords in place so callers see plaintext. One
+	// Decrypt the SSH password in place so callers see plaintext. An
 	// undecryptable field (lost/corrupt secret.key) must not take the
-	// whole config down — drop just that field and let the user re-enter
-	// it; the rest of the config stays usable.
-	for i := range state.Forwards {
-		if state.Forwards[i].SSHPassword != "" {
-			pt, err := decryptPassword(state.Forwards[i].SSHPassword)
-			if err != nil {
-				Logf("config: forward[%d] (%s) SSH password undecryptable: %v — clearing it, please re-enter",
-					i, state.Forwards[i].Name, err)
-				state.Forwards[i].SSHPassword = ""
-				continue
-			}
-			state.Forwards[i].SSHPassword = pt
+	// whole config down — drop just that field and let the user
+	// re-enter it; the rest of the config stays usable.
+	if state.Forward != nil && state.Forward.SSHPassword != "" {
+		pt, err := decryptPassword(state.Forward.SSHPassword)
+		if err != nil {
+			Logf("config: forward (%s) SSH password undecryptable: %v — clearing it, please re-enter",
+				state.Forward.Name, err)
+			state.Forward.SSHPassword = ""
+		} else {
+			state.Forward.SSHPassword = pt
 		}
 	}
 
@@ -116,7 +134,7 @@ func (cm *ConfigManager) Load() error {
 	return nil
 }
 
-// Save saves the current configuration to the JSON file. Encrypts
+// Save saves the current configuration to the JSON file. Encrypts the
 // SSHPassword and APIKey fields before writing. Refuses to write when
 // the manager is in read-only protection (see SetReadOnly).
 func (cm *ConfigManager) Save() error {
@@ -128,22 +146,20 @@ func (cm *ConfigManager) Save() error {
 	}
 
 	// Build an encrypted copy so we don't mutate in-memory state.
-	snapshot := AppState{
-		Forwards: make([]ForwardConfig, len(cm.state.Forwards)),
-		Settings: cm.state.Settings,
-	}
-	for i, f := range cm.state.Forwards {
-		snapshot.Forwards[i] = f
+	snapshot := AppState{Settings: cm.state.Settings}
+	if cm.state.Forward != nil {
+		f := *cm.state.Forward
 		if f.SSHPassword != "" {
 			ct, err := encryptPassword(f.SSHPassword)
 			if err != nil {
-				return fmt.Errorf("encrypt forward[%d] password: %w", i, err)
+				return fmt.Errorf("encrypt forward password: %w", err)
 			}
-			snapshot.Forwards[i].SSHPassword = ct
+			f.SSHPassword = ct
 		}
+		snapshot.Forward = &f
 	}
 	// Encrypt the API key too — it is a live credential that should
-	// not sit in plaintext next to the (already encrypted) passwords.
+	// not sit in plaintext next to the (already encrypted) password.
 	if snapshot.Settings.APIKey != "" {
 		ct, err := encryptPassword(snapshot.Settings.APIKey)
 		if err != nil {
@@ -155,68 +171,30 @@ func (cm *ConfigManager) Save() error {
 	return SaveConfig(cm.filePath, &snapshot)
 }
 
-// GetForwards returns a deep copy of all forwarding configurations.
-// Returning a copy prevents callers from mutating internal state and
-// bypassing the ConfigManager's locking discipline.
-func (cm *ConfigManager) GetForwards() []ForwardConfig {
+// GetForward returns the configured forwarding rule. ok is false when
+// no forward is configured (fresh install, config without a forward).
+func (cm *ConfigManager) GetForward() (ForwardConfig, bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	out := make([]ForwardConfig, len(cm.state.Forwards))
-	copy(out, cm.state.Forwards)
-	return out
+	if cm.state.Forward == nil {
+		return ForwardConfig{}, false
+	}
+	return *cm.state.Forward, true
 }
 
-// AddForward adds a new forwarding configuration
-func (cm *ConfigManager) AddForward(f ForwardConfig) {
+// SetForward replaces the configured forwarding rule wholesale. The
+// caller owns identity: reuse the existing ID when updating a
+// configured forward, generate one for a fresh config.
+func (cm *ConfigManager) SetForward(f ForwardConfig) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	cm.state.Forwards = append(cm.state.Forwards, f)
+	cm.state.Forward = &f
 }
 
-// UpdateForward updates an existing forwarding configuration by ID
-func (cm *ConfigManager) UpdateForward(id string, f ForwardConfig) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	for i, fwd := range cm.state.Forwards {
-		if fwd.ID == id {
-			cm.state.Forwards[i] = f
-			return true
-		}
-	}
-	return false
-}
-
-// DeleteForward removes a forwarding configuration by ID
-func (cm *ConfigManager) DeleteForward(id string) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	for i, fwd := range cm.state.Forwards {
-		if fwd.ID == id {
-			cm.state.Forwards = append(cm.state.Forwards[:i], cm.state.Forwards[i+1:]...)
-			return true
-		}
-	}
-	return false
-}
-
-// GetForward retrieves a specific forwarding configuration by ID
-func (cm *ConfigManager) GetForward(id string) (ForwardConfig, bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
-	for _, fwd := range cm.state.Forwards {
-		if fwd.ID == id {
-			return fwd, true
-		}
-	}
-	return ForwardConfig{}, false
-}
-
-// LoadConfig loads the application state from a JSON file
+// LoadConfig loads the application state from a JSON file, migrating
+// the legacy multi-forward layout to the single-forward shape.
 func LoadConfig(filePath string) (*AppState, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -229,6 +207,7 @@ func LoadConfig(filePath string) (*AppState, error) {
 	if err := decoder.Decode(state); err != nil {
 		return nil, err
 	}
+	state.normalizeLegacy()
 
 	return state, nil
 }
@@ -240,6 +219,9 @@ func LoadConfig(filePath string) (*AppState, error) {
 // never leave a half-written config.json behind. The temp file is created
 // with 0600 permissions because the config holds encrypted passwords.
 func SaveConfig(filePath string, state *AppState) error {
+	// Never persist the legacy shape, whatever the caller passed in.
+	state.normalizeLegacy()
+
 	dir := filepath.Dir(filePath)
 	tmp, err := os.CreateTemp(dir, ".ssh-tunnel-manager-*.json")
 	if err != nil {
@@ -275,10 +257,7 @@ func SaveConfig(filePath string, state *AppState) error {
 
 // DefaultConfig returns a default empty configuration
 func DefaultConfig() AppState {
-	return AppState{
-		Forwards: []ForwardConfig{},
-		Settings: AppSettings{},
-	}
+	return AppState{}
 }
 
 // SetReadOnly toggles read-only protection (see Save). Used by main

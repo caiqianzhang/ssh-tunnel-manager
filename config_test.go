@@ -12,12 +12,10 @@ func TestSaveAndLoadConfig(t *testing.T) {
 	defer os.Remove(tmpFile)
 
 	original := AppState{
-		Forwards: []ForwardConfig{
-			{
-				ID: "test-1", Name: "Test Server", RemoteHost: "example.com",
-				RemotePort: 8080, LocalHost: "localhost", LocalPort: 80,
-				SSHUser: "admin", AutoReconnect: true, MaxRetries: 5, RetryInterval: 5,
-			},
+		Forward: &ForwardConfig{
+			ID: "test-1", Name: "Test Server", RemoteHost: "example.com",
+			RemotePort: 8080, LocalHost: "localhost", LocalPort: 80,
+			SSHUser: "admin", AutoReconnect: true, MaxRetries: 5, RetryInterval: 5,
 		},
 	}
 
@@ -30,11 +28,60 @@ func TestSaveAndLoadConfig(t *testing.T) {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 
-	if len(loaded.Forwards) != 1 {
-		t.Fatalf("expected 1 forward, got %d", len(loaded.Forwards))
+	if loaded.Forward == nil {
+		t.Fatalf("expected 1 forward, got none")
 	}
-	if loaded.Forwards[0].Name != "Test Server" {
-		t.Errorf("expected name 'Test Server', got '%s'", loaded.Forwards[0].Name)
+	if loaded.Forward.Name != "Test Server" {
+		t.Errorf("expected name 'Test Server', got '%s'", loaded.Forward.Name)
+	}
+	// The current shape must never carry the legacy list.
+	if loaded.Forwards != nil {
+		t.Errorf("expected legacy Forwards to be dropped, got %d entries", len(loaded.Forwards))
+	}
+}
+
+// TestLoadMigratesLegacyForwardsList pins the single-forward migration:
+// configs written by pre-single-forward builds store a forwards array.
+// Loading must keep the first entry as the app's forward and drop the
+// rest, and re-saving must persist the current shape.
+func TestLoadMigratesLegacyForwardsList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	legacy := `{"forwards":[` +
+		`{"id":"first","name":"First","forward_type":"local","remote_host":"a","remote_port":22,"local_host":"l","local_port":2222,"ssh_user":"u","auto_reconnect":true,"max_retries":3,"retry_interval":5},` +
+		`{"id":"second","name":"Second","forward_type":"local","remote_host":"b","remote_port":22,"local_host":"l","local_port":3333,"ssh_user":"u","auto_reconnect":true,"max_retries":3,"retry_interval":5}` +
+		`],"settings":{}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cm := NewConfigManager(path)
+	if err := cm.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	fwd, ok := cm.GetForward()
+	if !ok {
+		t.Fatal("expected the first legacy forward to survive migration")
+	}
+	if fwd.ID != "first" {
+		t.Errorf("expected the FIRST legacy entry to win, got %q", fwd.ID)
+	}
+
+	// Round-trip: the migrated config must be written in the new shape.
+	cm2path := filepath.Join(t.TempDir(), "migrated.json")
+	cm2 := NewConfigManager(cm2path)
+	cm2.RestoreAppState(AppState{Forward: &fwd, Settings: AppSettings{}})
+	if err := cm2.Save(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(cm2path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"forwards"`) {
+		t.Errorf("migrated config still contains the legacy forwards array:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), `"forward"`) {
+		t.Errorf("migrated config missing the forward object:\n%s", raw)
 	}
 }
 
@@ -47,103 +94,44 @@ func TestLoadConfigFileNotFound(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if len(cfg.Forwards) != 0 {
-		t.Errorf("expected empty forwards, got %d", len(cfg.Forwards))
+	if cfg.Forward != nil {
+		t.Errorf("expected no forward in default config, got %+v", cfg.Forward)
 	}
 }
 
-func TestAddForward(t *testing.T) {
+func TestSetForward(t *testing.T) {
 	cm := NewConfigManager("/tmp/test.json")
 
 	fwd := ForwardConfig{
-		ID: "test-add", Name: "Add Test", RemoteHost: "test.com",
+		ID: "test-set", Name: "Set Test", RemoteHost: "test.com",
 		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
 		SSHUser: "user", AutoReconnect: false, MaxRetries: 3, RetryInterval: 10,
 	}
 
-	cm.AddForward(fwd)
-
-	forwards := cm.GetForwards()
-	if len(forwards) != 1 {
-		t.Fatalf("expected 1 forward, got %d", len(forwards))
-	}
-	if forwards[0].ID != "test-add" {
-		t.Errorf("expected ID 'test-add', got '%s'", forwards[0].ID)
-	}
-}
-
-func TestUpdateForward(t *testing.T) {
-	cm := NewConfigManager("/tmp/test.json")
-
-	fwd1 := ForwardConfig{
-		ID: "test-update", Name: "Original", RemoteHost: "test.com",
-		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
-		SSHUser: "user", AutoReconnect: false, MaxRetries: 3, RetryInterval: 10,
-	}
-	cm.AddForward(fwd1)
-
-	fwd2 := ForwardConfig{
-		ID: "test-update", Name: "Updated", RemoteHost: "test.com",
-		RemotePort: 22, LocalHost: "localhost", LocalPort: 3333,
-		SSHUser: "user", AutoReconnect: true, MaxRetries: 5, RetryInterval: 5,
+	// Unconfigured manager reports the absence explicitly.
+	if _, ok := cm.GetForward(); ok {
+		t.Fatal("expected no forward before SetForward")
 	}
 
-	updated := cm.UpdateForward("test-update", fwd2)
-	if !updated {
-		t.Fatal("expected update to succeed")
+	cm.SetForward(fwd)
+
+	got, ok := cm.GetForward()
+	if !ok {
+		t.Fatal("expected forward after SetForward")
+	}
+	if got.ID != "test-set" {
+		t.Errorf("expected ID 'test-set', got '%s'", got.ID)
 	}
 
-	forwards := cm.GetForwards()
-	if forwards[0].Name != "Updated" {
-		t.Errorf("expected name 'Updated', got '%s'", forwards[0].Name)
-	}
-	if forwards[0].LocalPort != 3333 {
-		t.Errorf("expected local port 3333, got %d", forwards[0].LocalPort)
-	}
-}
+	// SetForward replaces wholesale — there is exactly one rule.
+	replacement := fwd
+	replacement.ID = "replacement"
+	replacement.LocalPort = 3333
+	cm.SetForward(replacement)
 
-func TestDeleteForward(t *testing.T) {
-	cm := NewConfigManager("/tmp/test.json")
-
-	fwd := ForwardConfig{
-		ID: "test-delete", Name: "Delete Test", RemoteHost: "test.com",
-		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
-		SSHUser: "user", AutoReconnect: false, MaxRetries: 3, RetryInterval: 10,
-	}
-	cm.AddForward(fwd)
-
-	deleted := cm.DeleteForward("test-delete")
-	if !deleted {
-		t.Fatal("expected delete to succeed")
-	}
-
-	forwards := cm.GetForwards()
-	if len(forwards) != 0 {
-		t.Errorf("expected 0 forwards after delete, got %d", len(forwards))
-	}
-}
-
-func TestGetForward(t *testing.T) {
-	cm := NewConfigManager("/tmp/test.json")
-
-	fwd := ForwardConfig{
-		ID: "test-get", Name: "Get Test", RemoteHost: "test.com",
-		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
-		SSHUser: "user", AutoReconnect: false, MaxRetries: 3, RetryInterval: 10,
-	}
-	cm.AddForward(fwd)
-
-	got, found := cm.GetForward("test-get")
-	if !found {
-		t.Fatal("expected to find forward")
-	}
-	if got.Name != "Get Test" {
-		t.Errorf("expected name 'Get Test', got '%s'", got.Name)
-	}
-
-	_, found = cm.GetForward("nonexistent")
-	if found {
-		t.Fatal("expected not to find nonexistent forward")
+	got, _ = cm.GetForward()
+	if got.ID != "replacement" || got.LocalPort != 3333 {
+		t.Errorf("expected SetForward to replace the rule, got %+v", got)
 	}
 }
 
@@ -152,12 +140,11 @@ func TestConfigManagerLoadSave(t *testing.T) {
 	defer os.Remove(tmpFile)
 
 	cm1 := NewConfigManager(tmpFile)
-	fwd := ForwardConfig{
+	cm1.SetForward(ForwardConfig{
 		ID: "mgr-test", Name: "Manager Test", RemoteHost: "test.com",
 		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
 		SSHUser: "user", AutoReconnect: true, MaxRetries: 3, RetryInterval: 10,
-	}
-	cm1.AddForward(fwd)
+	})
 
 	if err := cm1.Save(); err != nil {
 		t.Fatalf("Save failed: %v", err)
@@ -168,59 +155,35 @@ func TestConfigManagerLoadSave(t *testing.T) {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	forwards := cm2.GetForwards()
-	if len(forwards) != 1 {
-		t.Fatalf("expected 1 forward after load, got %d", len(forwards))
+	fwd, ok := cm2.GetForward()
+	if !ok {
+		t.Fatalf("expected forward after load")
 	}
-	if forwards[0].ID != "mgr-test" {
-		t.Errorf("expected ID 'mgr-test', got '%s'", forwards[0].ID)
+	if fwd.ID != "mgr-test" {
+		t.Errorf("expected ID 'mgr-test', got '%s'", fwd.ID)
 	}
 }
 
-// Bug 16: GetForwards must return a deep copy so external mutation
-// cannot bypass the ConfigManager's locking/validation.
-func TestGetForwardsReturnsDeepCopy(t *testing.T) {
-	cm := NewConfigManager("/tmp/test_deep_copy.json")
-	cm.AddForward(ForwardConfig{
+// Bug 16: GetForward must return a copy so external mutation cannot
+// bypass the ConfigManager's locking discipline.
+func TestGetForwardReturnsCopy(t *testing.T) {
+	cm := NewConfigManager("/tmp/test_get_copy.json")
+	cm.SetForward(ForwardConfig{
 		ID: "x", Name: "original", RemoteHost: "r", RemotePort: 1,
 		LocalHost: "l", LocalPort: 2, SSHUser: "u",
 	})
 
-	got := cm.GetForwards()
-	if len(got) != 1 {
-		t.Fatalf("expected 1 forward, got %d", len(got))
+	got, ok := cm.GetForward()
+	if !ok {
+		t.Fatal("expected forward")
 	}
-	// Mutate the returned slice & element.
-	got[0].Name = "mutated"
-	got = append(got, ForwardConfig{ID: "y"})
+	// Mutate the returned value.
+	got.Name = "mutated"
 
 	// Re-read; state must be unchanged.
-	again := cm.GetForwards()
-	if again[0].Name != "original" {
-		t.Errorf("GetForwards leaked mutation; got Name=%q", again[0].Name)
-	}
-	if len(again) != 1 {
-		t.Errorf("GetForwards leaked appended element; got %d forwards", len(again))
-	}
-}
-
-// Bug 16: GetForward must also return a copy (by value, since
-// ForwardConfig contains no pointer fields, value semantics already
-// achieve this — but the test guards the contract).
-func TestGetForwardReturnsCopy(t *testing.T) {
-	cm := NewConfigManager("/tmp/test_get_copy.json")
-	cm.AddForward(ForwardConfig{
-		ID: "g", Name: "n", RemoteHost: "r", RemotePort: 1,
-		LocalHost: "l", LocalPort: 2, SSHUser: "u",
-	})
-	got, ok := cm.GetForward("g")
-	if !ok {
-		t.Fatal("expected found")
-	}
-	got.Name = "mutated"
-	again, _ := cm.GetForward("g")
-	if again.Name != "n" {
-		t.Errorf("GetForward returned aliased value; got Name=%q", again.Name)
+	again, _ := cm.GetForward()
+	if again.Name != "original" {
+		t.Errorf("GetForward leaked mutation; got Name=%q", again.Name)
 	}
 }
 
@@ -235,7 +198,7 @@ func TestConfigEncryptsPasswordOnDisk(t *testing.T) {
 	const secret = "my-SSH-password-123"
 	cfgFile := filepath.Join(tmp, "test_enc.json")
 	cm := NewConfigManager(cfgFile)
-	cm.AddForward(ForwardConfig{
+	cm.SetForward(ForwardConfig{
 		ID: "p", Name: "pw", RemoteHost: "r", RemotePort: 22,
 		LocalHost: "l", LocalPort: 2222, SSHUser: "u",
 		SSHPassword: secret,
@@ -257,12 +220,15 @@ func TestConfigEncryptsPasswordOnDisk(t *testing.T) {
 	if err := cm2.Load(); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := cm2.GetForward("p")
+	fwd, ok := cm2.GetForward()
 	if !ok {
 		t.Fatal("expected to find forward")
 	}
-	if got.SSHPassword != secret {
-		t.Errorf("decryption failed: got %q want %q", got.SSHPassword, secret)
+	if fwd.ID != "p" {
+		t.Fatalf("expected forward ID 'p', got %q", fwd.ID)
+	}
+	if fwd.SSHPassword != secret {
+		t.Errorf("decryption failed: got %q want %q", fwd.SSHPassword, secret)
 	}
 }
 
@@ -285,12 +251,12 @@ func TestConfigLoadsLegacyPlaintextPassword(t *testing.T) {
 	if err := cm.Load(); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := cm.GetForward("l")
+	fwd, ok := cm.GetForward()
 	if !ok {
 		t.Fatal("expected to find forward")
 	}
-	if got.SSHPassword != secret {
-		t.Errorf("legacy plaintext not preserved: got %q want %q", got.SSHPassword, secret)
+	if fwd.SSHPassword != secret {
+		t.Errorf("legacy plaintext not preserved: got %q want %q", fwd.SSHPassword, secret)
 	}
 }
 

@@ -1,20 +1,18 @@
 {
-  "forwards": [
-    {
-      "id": "fwd_<unix_nano>",
-      "name": "default",
-      "forward_type": "local",
-      "remote_host": "example.com",
-      "remote_port": 22,
-      "local_host": "localhost",
-      "local_port": 2222,
-      "ssh_user": "your_user",
-      "ssh_password": "",
-      "auto_reconnect": true,
-      "max_retries": 5,
-      "retry_interval": 5
-    }
-  ],
+  "forward": {
+    "id": "fwd_<unix_nano>",
+    "name": "default",
+    "forward_type": "local",
+    "remote_host": "example.com",
+    "remote_port": 22,
+    "local_host": "localhost",
+    "local_port": 2222,
+    "ssh_user": "your_user",
+    "ssh_password": "",
+    "auto_reconnect": true,
+    "max_retries": 5,
+    "retry_interval": 5
+  },
   "settings": {
     "api_key": "<your_api_key>",
     "ddns_check_interval": 15,

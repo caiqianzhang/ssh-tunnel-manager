@@ -12,8 +12,11 @@
   现有的 known_hosts/agent 配置仍然有效
 - 连接时的 DDNS 快速路径：若存在 `baidu.key`，服务器 IP 通过百度云
   DNS API 获取（权威解析，绕过本地过期的 resolver 缓存），随后刷新
-  操作系统 DNS 缓存；心跳（默认 15 秒，可通过
-  `settings.ddns_check_interval` 调整）在 IP 变化时自动重启隧道
+  操作系统 DNS 缓存；否则直接查询 `settings.dns_resolver`（默认
+  `119.29.29.29`）。两条路径都会把解析到的 IP 直接交给 ssh 连接，
+  隧道不再依赖第二次可能过期的本地解析。心跳（默认 15 秒，可通过
+  `settings.ddns_check_interval` 调整）在 IP 变化时自动重启隧道，
+  无 `baidu.key` 时同样生效
 - 可选的域名解析优化（Linux/桌面端）：在设置页面一键安装
   systemd-resolved drop-in（通过 pkexec 密码提示），将转发域名的解析
   路由到其权威 nameserver，使本地工具如 ping/curl 解析到最新地址，
@@ -48,6 +51,10 @@ make test
 ./build/ssh-tunnel-manager
 ```
 
+Windows 构建为 best-effort：单实例锁、端口占用的进程识别与结束、
+域名解析优化均依赖 Linux 工具（flock/unix socket、ss/fuser/lsof、
+pkexec + resolvectl），在 Windows 上不可用或降级。
+
 构建时将版本号（git describe）注入二进制；设置页面会显示它。可选的
 运行时辅助程序会被自动检测：`pkexec` + `resolvectl` 驱动设置中的
 域名解析优化行。
@@ -65,16 +72,20 @@ ssh-tunnel-manager 条目。
 
 ## 配置
 
-配置保存在 `~/.config/ssh-tunnel-manager/config.json`；存储的 SSH
+应用只管理一条转发规则。配置保存在
+`~/.config/ssh-tunnel-manager/config.json`；存储的 SSH
 密码的加密密钥单独保存在
 `~/.local/share/ssh-tunnel-manager/secret.key`，这样配置备份不会
 携带它。首次运行时两者都会从旧的可执行目录布局自动迁移。日志写入
-每用户的缓存目录。
+每用户的缓存目录。旧版本（多转发列表格式）的 `config.json`
+在加载时会自动迁移：保留第一条转发规则，其余丢弃。
 
 已提交一个带占位值的模板 `config.example.json`。将其复制为
 `config.json`（首次运行时会自动创建），并在连接前编辑其中的值。
 `settings.api_key` 是通过隧道发送的 Anthropic API 密钥，由应用内的
-测试按钮使用（可选）。
+测试按钮使用（可选）。注意：SSH 密码字段留空表示“保留已存密码”，
+因此一旦设置密码就无法通过界面清除——如需清除，请编辑或删除
+`config.json` 中的对应字段。
 
 当 `baidu.key` 存在时，应用使用百度云 DNS API 解析转发的主机名；
 当其不存在时，回退到 `settings.dns_resolver` 中的 DNS 服务器

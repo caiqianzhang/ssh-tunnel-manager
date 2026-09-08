@@ -87,9 +87,6 @@ type UI struct {
 	zonePending     string // action to run when the button is clicked
 	zoneStatusText  string // one-line status shown above the button
 
-	// Animation
-	animTick int
-
 	// Port conflict dialog
 	showPortConflictDialog bool
 	// showNewPortEntry reveals the change-port input only after the
@@ -211,9 +208,7 @@ func NewUI(cfg *ConfigManager, sshMgr *SSHManager) *UI {
 }
 
 func (ui *UI) loadConfigToForm() {
-	forwards := ui.config.GetForwards()
-	if len(forwards) > 0 {
-		fwd := forwards[0]
+	if fwd, ok := ui.config.GetForward(); ok {
 		ui.remoteHostEntry.SetText(fwd.RemoteHost)
 		ui.remotePortEntry.SetText(strconv.Itoa(fwd.RemotePort))
 		ui.localHostEntry.SetText(fwd.LocalHost)
@@ -246,8 +241,6 @@ func (ui *UI) loadConfigToForm() {
 }
 
 func (ui *UI) Layout(gtx layout.Context) layout.Dimensions {
-	ui.animTick++
-
 	// Fill background
 	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
 	paint.Fill(gtx.Ops, ColorBg)
@@ -366,7 +359,10 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 		if _, ok := ui.killProcessBtn.Update(gtx); ok {
 			// conflictBusy stays true until handleKillProcess's async
 			// connect completes (it queues conflictBusy=false itself).
+			// connectBusy is held alongside it so a 连接 click cannot
+			// race the dialog's connect (see checkPortAndConnect).
 			ui.conflictBusy = true
+			ui.connectBusy = true
 			ui.handleKillProcess()
 		}
 		if _, ok := ui.changePortBtn.Update(gtx); ok {
@@ -379,6 +375,7 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 			// stays true until handleChangePort's async connect
 			// completes (it queues conflictBusy=false itself).
 			ui.conflictBusy = true
+			ui.connectBusy = true
 			ui.handleChangePort()
 		}
 		if _, ok := ui.overlayBtn.Update(gtx); ok {
@@ -393,11 +390,13 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 // later via setTestResult / showPortConflictDialog.
 func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 	// Re-entrancy guard (UI thread): a double-click — or a click racing
-	// autoConnect — must not enqueue two racing connect attempts that
-	// both pass the 150ms port check. Without the guard the loser
-	// reports "连接失败: connection already exists" while the tunnel
-	// actually came up.
-	if ui.connectBusy {
+	// autoConnect or a conflict-dialog connect — must not enqueue two
+	// racing connect attempts that both pass the 150ms port check.
+	// Without the guard the loser reports "连接失败: connection already
+	// exists" while the tunnel actually came up. conflictBusy counts as
+	// busy too: the dialog's kill/change-port handlers run their own
+	// async Connect, and a 连接 click must not fight it.
+	if ui.connectBusy || ui.conflictBusy {
 		return
 	}
 
@@ -452,14 +451,13 @@ func (ui *UI) checkPortAndConnect(fwd ForwardConfig) {
 }
 
 func (ui *UI) toggleConnection() {
-	forwards := ui.config.GetForwards()
-	if len(forwards) == 0 {
+	fwd, ok := ui.config.GetForward()
+	if !ok {
 		// Bug 6: be explicit when the user tries to connect with no
 		// configured forward. Previously the click silently did nothing.
 		ui.setTestResult("✗ 未配置转发规则，请先在设置中添加", false)
 		return
 	}
-	fwd := forwards[0]
 	ui.checkPortAndConnect(fwd)
 }
 
@@ -488,14 +486,14 @@ func (ui *UI) showConflictDialogInternal(port int, process string, showNewPort b
 // handleKillProcess kills the process using the conflicting port and then attempts to connect.
 func (ui *UI) handleKillProcess() {
 	Log("UI.handleKillProcess: user clicked kill process button")
-	forwards := ui.config.GetForwards()
-	if len(forwards) == 0 {
-		Log("UI.handleKillProcess: no forwards configured")
+	fwd, ok := ui.config.GetForward()
+	if !ok {
+		Log("UI.handleKillProcess: no forward configured")
 		ui.showPortConflictDialog = false
 		ui.conflictBusy = false
+		ui.connectBusy = false
 		return
 	}
-	fwd := forwards[0]
 	Logf("UI.handleKillProcess: attempting to kill process on port %d", fwd.LocalPort)
 
 	// Kill + reconnect OFF the UI thread: KillProcessByPort can run a
@@ -509,6 +507,7 @@ func (ui *UI) handleKillProcess() {
 			ui.queueUIFunc(func() {
 				ui.setTestResult(fmt.Sprintf("结束进程失败: %v", err), false)
 				ui.conflictBusy = false
+				ui.connectBusy = false
 				// Keep the dialog open: the user may retry the kill or
 				// switch to 更换端口 instead.
 			})
@@ -528,19 +527,22 @@ func (ui *UI) handleKillProcess() {
 			Logf("UI.handleKillProcess: connect failed after kill: %v", err)
 			ui.queueUIFunc(func() { ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false) })
 		}
-		ui.queueUIFunc(func() { ui.conflictBusy = false })
+		ui.queueUIFunc(func() {
+			ui.conflictBusy = false
+			ui.connectBusy = false
+		})
 	}()
 }
 
 // handleChangePort changes the local port to the user-specified value and attempts to connect.
 func (ui *UI) handleChangePort() {
-	forwards := ui.config.GetForwards()
-	if len(forwards) == 0 {
+	fwd, ok := ui.config.GetForward()
+	if !ok {
 		ui.showPortConflictDialog = false
 		ui.conflictBusy = false
+		ui.connectBusy = false
 		return
 	}
-	fwd := forwards[0]
 
 	// Parse new port
 	newPortStr := strings.TrimSpace(ui.newPortEntry.Text())
@@ -548,16 +550,18 @@ func (ui *UI) handleChangePort() {
 	if err != nil || newPort < 1 || newPort > 65535 {
 		ui.setTestResult("无效的端口号", false)
 		ui.conflictBusy = false
+		ui.connectBusy = false
 		return
 	}
 
 	// Update config with new port
 	fwd.LocalPort = newPort
-	ui.config.UpdateForward(fwd.ID, fwd)
+	ui.config.SetForward(fwd)
 	if err := ui.config.Save(); err != nil {
 		ui.setTestResult(fmt.Sprintf("保存配置失败: %v", err), false)
 		ui.showPortConflictDialog = false
 		ui.conflictBusy = false
+		ui.connectBusy = false
 		return
 	}
 
@@ -576,7 +580,10 @@ func (ui *UI) handleChangePort() {
 		if err := ui.ssh.Connect(fwd); err != nil {
 			ui.queueUIFunc(func() { ui.setTestResult(fmt.Sprintf("连接失败: %v", err), false) })
 		}
-		ui.queueUIFunc(func() { ui.conflictBusy = false })
+		ui.queueUIFunc(func() {
+			ui.conflictBusy = false
+			ui.connectBusy = false
+		})
 	}()
 }
 
@@ -596,13 +603,11 @@ func (ui *UI) testAPI() {
 	ui.testOK = false
 	ui.testMu.Unlock()
 
-	forwards := ui.config.GetForwards()
-	if len(forwards) == 0 {
+	fwd, ok := ui.config.GetForward()
+	if !ok {
 		ui.setTestResult("未配置转发规则", false)
 		return
 	}
-
-	fwd := forwards[0]
 	addr := net.JoinHostPort(fwd.LocalHost, strconv.Itoa(fwd.LocalPort))
 
 	// Step 1: Check if SSH tunnel is running
@@ -652,9 +657,9 @@ func (ui *UI) testAPI() {
 		Logf("testAPI: HTTP %d, no body", resp.StatusCode)
 	}
 
-	ok := resp.StatusCode >= 200 && resp.StatusCode < 400
+	respOK := resp.StatusCode >= 200 && resp.StatusCode < 400
 	var msg string
-	if ok {
+	if respOK {
 		msg = fmt.Sprintf("✓ 接口可用 (HTTP %d)", resp.StatusCode)
 	} else {
 		// Show HTTP status + first 200 chars of body for diagnosis
@@ -668,7 +673,7 @@ func (ui *UI) testAPI() {
 			msg = fmt.Sprintf("✗ HTTP %d: %s", resp.StatusCode, short)
 		}
 	}
-	ui.setTestResult(msg, ok)
+	ui.setTestResult(msg, respOK)
 }
 
 func (ui *UI) setTestResult(msg string, ok bool) {
@@ -719,27 +724,21 @@ func (ui *UI) saveSettings() {
 	// immediately (so the app keeps working during Save), and if Save
 	// fails we restore this state — otherwise the app would keep
 	// running on values that were never persisted.
-	forwards := ui.config.GetForwards()
+	existing, hadExisting := ui.config.GetForward()
 	prevAPIKey := ui.config.GetAPIKey()
 	prevDDNS := ui.config.GetDDNSCheckInterval()
 	prevDNSResolver := ui.config.GetDNSResolver()
-	var id string
-	var existing ForwardConfig
-	hadExisting := false
-	if len(forwards) > 0 {
-		id = forwards[0].ID
-		existing = forwards[0]
-		hadExisting = true
-	} else {
+	id := existing.ID
+	if !hadExisting {
 		id = fmt.Sprintf("fwd_%d", time.Now().UnixNano())
 	}
 
 	// Bug 3: preserve MaxRetries/RetryInterval from the existing
 	// forward, otherwise default to 5/5. We also preserve SSHPassword
 	// when the user left the field empty (avoids wiping a stored pw
-	// because the form is unmasked) and the custom Name. The forward is
-	// updated in place (UpdateForward) instead of delete+re-add, so a
-	// failed Save can never leave memory and disk diverging.
+	// because the form is unmasked) and the custom Name. SetForward
+	// replaces the rule wholesale, so a failed Save can never leave
+	// memory and disk diverging.
 	maxRetries := 5
 	retryInterval := 5
 	name := "default"
@@ -776,11 +775,7 @@ func (ui *UI) saveSettings() {
 		MaxRetries:    maxRetries,
 		RetryInterval: retryInterval,
 	}
-	if hadExisting {
-		ui.config.UpdateForward(id, updated)
-	} else {
-		ui.config.AddForward(updated)
-	}
+	ui.config.SetForward(updated)
 
 	// Save API key
 	ui.config.SetAPIKey(strings.TrimSpace(ui.apiKeyEntry.Text()))
@@ -803,12 +798,12 @@ func (ui *UI) saveSettings() {
 		ui.ssh.SetDDNSCheckInterval(time.Duration(DefaultDDNSIntervalSeconds) * time.Second)
 	}
 
-		// Save the DNS resolver and live-apply it: the fallback resolver
-		// is read from this package-level var by ssh.ResolveHost, so it
-		// takes effect for tunnels started or reconnected from now on.
-		dnsResolver := strings.TrimSpace(ui.dnsResolverEntry.Text())
-		ui.config.SetDNSResolver(dnsResolver)
-		SetDNSResolver(dnsResolver)
+	// Save the DNS resolver and live-apply it: the fallback resolver
+	// is read from this package-level var by ssh.ResolveHost, so it
+	// takes effect for tunnels started or reconnected from now on.
+	dnsResolver := strings.TrimSpace(ui.dnsResolverEntry.Text())
+	ui.config.SetDNSResolver(dnsResolver)
+	SetDNSResolver(dnsResolver)
 
 	// Bug 5: report save failure to the user and keep them on the
 	// settings page so they can retry. Roll back the in-memory state so
@@ -816,10 +811,14 @@ func (ui *UI) saveSettings() {
 	if err := ui.config.Save(); err != nil {
 		fmt.Println("Error saving config:", err)
 		Logf("UI.saveSettings: save error: %v", err)
-		ui.config.RestoreAppState(AppState{
-			Forwards: forwards,
+		rollback := AppState{
 			Settings: AppSettings{APIKey: prevAPIKey, DDNSCheckInterval: prevDDNS, DNSResolver: prevDNSResolver},
-		})
+		}
+		if hadExisting {
+			f := existing
+			rollback.Forward = &f
+		}
+		ui.config.RestoreAppState(rollback)
 		if prevDDNS > 0 {
 			ui.ssh.SetDDNSCheckInterval(time.Duration(prevDDNS) * time.Second)
 		} else {
@@ -893,10 +892,11 @@ func (ui *UI) restartWithConfig(fwd ForwardConfig) {
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════
 
-func getFirstForwardID(cfg *ConfigManager) string {
-	forwards := cfg.GetForwards()
-	if len(forwards) > 0 {
-		return forwards[0].ID
+// currentForwardID returns the configured forward's ID, or "" when no
+// forward is configured (ssh.GetStatus("") then reports not_found).
+func currentForwardID(cfg *ConfigManager) string {
+	if fwd, ok := cfg.GetForward(); ok {
+		return fwd.ID
 	}
 	return ""
 }
@@ -934,17 +934,14 @@ func (ui *UI) refreshZoneForwardStatusAsync() {
 	// goroutines race, and the old one can finish last).
 	ui.zoneRefreshGen++
 	gen := ui.zoneRefreshGen
-	forwards := ui.config.GetForwards()
+	fwd, _ := ui.config.GetForward()
 	go func() {
 		if !zoneForwardSupported() {
 			return
 		}
 		var zone string
-		if len(forwards) > 0 {
-			host := forwards[0].RemoteHost
-			if host != "" && net.ParseIP(host) == nil {
-				zone, _ = deriveZoneAndSub(host)
-			}
+		if fwd.RemoteHost != "" && net.ParseIP(fwd.RemoteHost) == nil {
+			zone, _ = deriveZoneAndSub(fwd.RemoteHost)
 		}
 		var text, action, pending string
 		switch {
@@ -996,11 +993,11 @@ func (ui *UI) startZoneForwardAction() {
 	action := ui.zonePending
 	go func() {
 		err := func() error {
-			forwards := ui.config.GetForwards()
-			if len(forwards) == 0 {
+			fwd, ok := ui.config.GetForward()
+			if !ok {
 				return fmt.Errorf("未配置转发规则")
 			}
-			host := forwards[0].RemoteHost
+			host := fwd.RemoteHost
 			if host == "" || net.ParseIP(host) != nil {
 				return fmt.Errorf("远端地址无需解析优化")
 			}

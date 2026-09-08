@@ -169,7 +169,10 @@ func runPolkitScript(script string) error {
 	if _, err := exec.LookPath("pkexec"); err != nil {
 		return fmt.Errorf("未找到图形授权工具 pkexec，请手动执行: %s", script)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Generous window: the pkexec dialog may wait for the user to come
+	// back to the machine and type their password; 2 minutes used to
+	// abort a perfectly valid authentication attempt.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "pkexec", "sh", "-c", script).CombinedOutput()
 	if err != nil {

@@ -152,7 +152,7 @@ func TestConfigPersistence(t *testing.T) {
 	tmpFile := t.TempDir() + "/test_persistence.json"
 
 	cfg1 := NewConfigManager(tmpFile)
-	cfg1.AddForward(ForwardConfig{
+	cfg1.SetForward(ForwardConfig{
 		ID:            "test-1",
 		Name:          "default",
 		ForwardType:   "local",
@@ -173,15 +173,15 @@ func TestConfigPersistence(t *testing.T) {
 		t.Fatalf("failed to load config: %v", err)
 	}
 
-	forwards := cfg2.GetForwards()
-	if len(forwards) != 1 {
-		t.Fatalf("expected 1 forward, got %d", len(forwards))
+	fwd, ok := cfg2.GetForward()
+	if !ok {
+		t.Fatalf("expected 1 forward, got none")
 	}
-	if forwards[0].RemoteHost != "192.168.1.33" {
-		t.Errorf("expected remote host '192.168.1.33', got '%s'", forwards[0].RemoteHost)
+	if fwd.RemoteHost != "192.168.1.33" {
+		t.Errorf("expected remote host '192.168.1.33', got '%s'", fwd.RemoteHost)
 	}
-	if forwards[0].SSHPassword != "1" {
-		t.Errorf("expected password '1', got '%s'", forwards[0].SSHPassword)
+	if fwd.SSHPassword != "1" {
+		t.Errorf("expected password '1', got '%s'", fwd.SSHPassword)
 	}
 }
 
@@ -191,7 +191,7 @@ func TestLoadConfigToForm(t *testing.T) {
 	sshMgr := NewSSHManager()
 
 	// Add a config
-	cfg.AddForward(ForwardConfig{
+	cfg.SetForward(ForwardConfig{
 		ID:            "test-load",
 		Name:          "default",
 		ForwardType:   "remote",
@@ -224,9 +224,6 @@ func TestLoadConfigToForm(t *testing.T) {
 	if ui2.autoReconnect.Value {
 		t.Error("expected autoReconnect to be false")
 	}
-
-	// Cleanup
-	cfg.DeleteForward("test-load")
 }
 
 // TestSSHFowardingCommand tests SSH command generation.
@@ -253,6 +250,7 @@ func TestSSHFowardingCommand(t *testing.T) {
 				"-o ServerAliveInterval=60",
 				"-o ServerAliveCountMax=3",
 				"-o ExitOnForwardFailure=yes",
+				"-o ConnectTimeout=10",
 				"-o StrictHostKeyChecking=accept-new",
 				"-o UserKnownHostsFile=",
 				"-l you 192.168.1.33",
@@ -275,6 +273,7 @@ func TestSSHFowardingCommand(t *testing.T) {
 				"-o ServerAliveInterval=60",
 				"-o ServerAliveCountMax=3",
 				"-o ExitOnForwardFailure=yes",
+				"-o ConnectTimeout=10",
 				"-o StrictHostKeyChecking=accept-new",
 				"-o UserKnownHostsFile=",
 				"-l admin example.com",
@@ -285,7 +284,7 @@ func TestSSHFowardingCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := FormatSSHCommand(tt.cfg)
+			cmd := "ssh " + strings.Join(sshArgs(tt.cfg, ""), " ")
 			for _, want := range tt.contains {
 				if !strings.Contains(cmd, want) {
 					t.Errorf("expected command to contain %q, got:\n%s", want, cmd)
@@ -311,7 +310,7 @@ func TestSaveSettingsPreservesMaxRetriesAndInterval(t *testing.T) {
 	cfgFile := filepath.Join(tmpDir, "test_save.json")
 	cm := NewConfigManager(cfgFile)
 	// Seed an existing forward with custom retry settings.
-	cm.AddForward(ForwardConfig{
+	cm.SetForward(ForwardConfig{
 		ID: "preserve-1", Name: "p", RemoteHost: "r", RemotePort: 22,
 		LocalHost: "l", LocalPort: 2222, SSHUser: "u",
 		AutoReconnect: true,
@@ -339,9 +338,12 @@ func TestSaveSettingsPreservesMaxRetriesAndInterval(t *testing.T) {
 	if err := cm2.Load(); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := cm2.GetForward("preserve-1")
+	got, ok := cm2.GetForward()
 	if !ok {
-		t.Fatal("expected forward to be preserved by ID")
+		t.Fatalf("expected 1 forward, got none")
+	}
+	if got.ID != "preserve-1" {
+		t.Fatalf("expected forward to be preserved by ID, got %q", got.ID)
 	}
 	if got.MaxRetries != 12 {
 		t.Errorf("MaxRetries overwritten: got %d, want 12", got.MaxRetries)
@@ -518,7 +520,7 @@ func TestCheckPortAndConnectCleansUpStaleConn(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	cm := NewConfigManager(filepath.Join(tmpDir, "stale.json"))
-	cm.AddForward(ForwardConfig{
+	cm.SetForward(ForwardConfig{
 		ID: "stale-1", Name: "default", ForwardType: "local",
 		RemoteHost: "this-host-does-not-exist.invalid",
 		RemotePort: 22, LocalHost: "localhost", LocalPort: 2222,
@@ -547,7 +549,10 @@ func TestCheckPortAndConnectCleansUpStaleConn(t *testing.T) {
 	// Deterministic port check: port is free, so we proceed to connect.
 	ui.portChecker = func(port int) (bool, string, error) { return false, "", nil }
 
-	fwd := cm.GetForwards()[0]
+	fwd, ok := cm.GetForward()
+	if !ok {
+		t.Fatal("setup: expected the seeded forward")
+	}
 	ui.checkPortAndConnect(fwd)
 
 	// The stale conn must have been cleaned up synchronously before the

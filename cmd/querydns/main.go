@@ -61,7 +61,9 @@ func main() {
 		},
 	}
 
-	// Query ALL records for the domain
+	// Query ALL records for the domain. Results are paginated server-side
+	// (mirroring the main app's listRecords): a zone with more than one
+	// page of records would otherwise silently hide its later entries.
 	path := "/v1/domain/resolve/list"
 	url := apiBase + bcd.CanonicalURI(path)
 
@@ -69,64 +71,74 @@ func main() {
 	// applies Go string escaping (\xNN), which is not valid JSON, so a
 	// zone containing a raw control byte or invalid UTF-8 byte would
 	// produce a body the API rejects as HTTP 400.
-	bodyBytes, err := json.Marshal(map[string]interface{}{
-		"domain":  zone,
-		"pageNo":  1,
-		"pageSize": 100,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "querydns: marshal request body: %v\n", err)
-		os.Exit(1)
-	}
-	body := string(bodyBytes)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "querydns: create request: %v\n", err)
-		os.Exit(1)
-	}
-
-	now := time.Now().UTC()
-	req.Header.Set("Authorization", bcd.SignRequest(ak, sk, "POST", path, now))
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Host", bcd.Host)
+	const pageSize = 100
+	const maxPages = 10 // same hard stop as the main app
 
 	// Request context goes to stderr: it is debugging scaffolding, not
 	// the data a piping consumer reads.
-	fmt.Fprintf(os.Stderr, "=== Request ===\nPOST %s\nBody: %s\n\n", url, body)
+	fmt.Fprintf(os.Stderr, "=== Request ===\nPOST %s\n\n", url)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "querydns: request failed: %v\n", err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
+	var all []json.RawMessage
+	for pageNo := 1; pageNo <= maxPages; pageNo++ {
+		bodyBytes, err := json.Marshal(map[string]interface{}{
+			"domain":   zone,
+			"pageNo":   pageNo,
+			"pageSize": pageSize,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: marshal request body: %v\n", err)
+			os.Exit(1)
+		}
+		body := string(bodyBytes)
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "querydns: read response: %v\n", err)
-		os.Exit(1)
+		req, err := http.NewRequest("POST", url, strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: create request: %v\n", err)
+			os.Exit(1)
+		}
+
+		now := time.Now().UTC()
+		req.Header.Set("Authorization", bcd.SignRequest(ak, sk, "POST", path, now))
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		req.Header.Set("Host", bcd.Host)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: request failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: read response: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Non-2xx is an API error, not a result set: report it on stderr
+		// so a wrapper that captures stdout (output=$(querydns ...)) does
+		// not get Baidu's error envelope mixed into the record list.
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			fmt.Fprintf(os.Stderr, "=== Response (HTTP %d) ===\n%s\n", resp.StatusCode, string(respBody))
+			os.Exit(1)
+		}
+
+		var payload struct {
+			Result []json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal(respBody, &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "querydns: parse error: %v\n", err)
+			os.Exit(1)
+		}
+
+		all = append(all, payload.Result...)
+		if len(payload.Result) < pageSize {
+			break // last page
+		}
 	}
 
-	// Non-2xx is an API error, not a result set: report it on stderr so a
-	// wrapper that captures stdout (output=$(querydns ...)) does not get
-	// Baidu's error envelope mixed into the record list.
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "=== Response (HTTP %d) ===\n%s\n", resp.StatusCode, string(respBody))
-		os.Exit(1)
-	}
-
-	// Parse and display records.
-	var payload struct {
-		Result []json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(respBody, &payload); err != nil {
-		fmt.Fprintf(os.Stderr, "querydns: parse error: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("=== Records (%d) ===\n", len(payload.Result))
-	for i, r := range payload.Result {
+	fmt.Printf("=== Records (%d) ===\n", len(all))
+	for i, r := range all {
 		var rec struct {
 			RecordID int    `json:"recordId"`
 			Domain   string `json:"domain"`

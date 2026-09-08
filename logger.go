@@ -11,9 +11,8 @@ import (
 
 // Logger provides a simple file-based logging facility.
 type Logger struct {
-	mu      sync.Mutex
-	file    *os.File
-	logPath string
+	mu   sync.Mutex
+	file *os.File
 }
 
 var globalLogger *Logger
@@ -49,8 +48,7 @@ func InitLogger() (string, error) {
 	}
 
 	globalLogger = &Logger{
-		file:    f,
-		logPath: logPath,
+		file: f,
 	}
 
 	Log("=== SSH Tunnel Manager started ===")
@@ -103,12 +101,4 @@ func CloseLogger() {
 	if globalLogger.file != nil {
 		globalLogger.file.Close()
 	}
-}
-
-// GetLogPath returns the current log file path.
-func GetLogPath() string {
-	if globalLogger == nil {
-		return ""
-	}
-	return globalLogger.logPath
 }

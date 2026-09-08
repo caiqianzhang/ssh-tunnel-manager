@@ -23,19 +23,19 @@ import (
 func (ui *UI) settingsCardForward(gtx layout.Context) layout.Dimensions {
 	fields := func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-			layout.Rigid(ui.settingsField(gtx, "远程主机", &ui.remoteHostEntry)),
+			layout.Rigid(ui.settingsField("远程主机", &ui.remoteHostEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "远程端口", &ui.remotePortEntry)),
+			layout.Rigid(ui.settingsField("远程端口", &ui.remotePortEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "本地主机", &ui.localHostEntry)),
+			layout.Rigid(ui.settingsField("本地主机", &ui.localHostEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "本地端口", &ui.localPortEntry)),
+			layout.Rigid(ui.settingsField("本地端口", &ui.localPortEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "SSH 用户", &ui.sshUserEntry)),
+			layout.Rigid(ui.settingsField("SSH 用户", &ui.sshUserEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "SSH 密码", &ui.sshPasswordEntry)),
+			layout.Rigid(ui.settingsField("SSH 密码", &ui.sshPasswordEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "API Key (x-api-key)", &ui.apiKeyEntry)),
+			layout.Rigid(ui.settingsField("API Key (x-api-key)", &ui.apiKeyEntry)),
 		)
 	}
 	return fields(gtx)
@@ -54,9 +54,9 @@ func (ui *UI) settingsCardAdvanced(gtx layout.Context) layout.Dimensions {
 	}
 	return ui.drawSection(gtx, "高级选项", func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceBetween}.Layout(gtx,
-			layout.Rigid(ui.settingsField(gtx, "DDNS 探测周期(秒)", &ui.ddnsIntervalEntry)),
+			layout.Rigid(ui.settingsField("DDNS 探测周期(秒)", &ui.ddnsIntervalEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
-			layout.Rigid(ui.settingsField(gtx, "DNS 解析服务器", &ui.dnsResolverEntry)),
+			layout.Rigid(ui.settingsField("DNS 解析服务器", &ui.dnsResolverEntry)),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
 			layout.Rigid(checkbox(&ui.autoReconnect, "自动重连")),
 			layout.Rigid(layout.Spacer{Height: 10}.Layout),
@@ -106,7 +106,7 @@ func (ui *UI) drawSection(gtx layout.Context, title string, content layout.Widge
 }
 
 // settingsField renders a label above a dark filled input.
-func (ui *UI) settingsField(gtx layout.Context, label string, editor *widget.Editor) layout.Widget {
+func (ui *UI) settingsField(label string, editor *widget.Editor) layout.Widget {
 	return func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceBetween}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {

@@ -66,23 +66,6 @@ func configFile() (string, error) {
 	return dst, nil
 }
 
-// secretKeyFile returns the path of the AES key file, migrating a
-// legacy secret.key from the working directory if needed.
-func secretKeyFile() (string, error) {
-	dir, err := appDataDir()
-	if err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	dst := filepath.Join(dir, "secret.key")
-	if _, err := os.Stat(dst); os.IsNotExist(err) {
-		migrateFile("secret.key", dst)
-	}
-	return dst, nil
-}
-
 // knownHostsFile returns the path of the per-user SSH known-hosts
 // file. StrictHostKeyChecking=accept-new refuses to connect to a host
 // whose key has changed, so the file must persist between runs.

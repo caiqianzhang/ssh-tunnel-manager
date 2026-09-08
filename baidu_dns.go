@@ -19,10 +19,10 @@ import (
 
 // Baidu Cloud DNS (BCD) API integration.
 //
-// Ported from the Rust reference (docs/reference/baidu_dns.rs). Provides fast IP resolution
-// for the DDNS scenario: when the server's IP changes, the Baidu DNS API
-// returns the current IP immediately, bypassing DNS propagation delay
-// (which is bounded by the record TTL).
+// Provides fast IP resolution for the DDNS scenario: when the server's
+// IP changes, the Baidu DNS API returns the current IP immediately,
+// bypassing DNS propagation delay (which is bounded by the record
+// TTL).
 //
 // Credentials (AK/SK) are read from baidu.key — a local file that is
 // git-ignored. If the file is missing or malformed, the integration
@@ -108,17 +108,17 @@ func findBaiduKey() (string, error) {
 	return "", fmt.Errorf("baidu.key not found")
 }
 
-// DnsTarget holds Baidu DNS API credentials and the target zone.
-type DnsTarget struct {
+// DNSTarget holds Baidu DNS API credentials and the target zone.
+type DNSTarget struct {
 	AccessKey string
 	SecretKey string
 	Zone      string
 	APIBase   string
 }
 
-// NewDnsTarget creates a DnsTarget with the given credentials and zone.
-func NewDnsTarget(accessKey, secretKey, zone, apiBase string) *DnsTarget {
-	return &DnsTarget{
+// NewDNSTarget creates a DNSTarget with the given credentials and zone.
+func NewDNSTarget(accessKey, secretKey, zone, apiBase string) *DNSTarget {
+	return &DNSTarget{
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		Zone:      zone,
@@ -130,7 +130,7 @@ func NewDnsTarget(accessKey, secretKey, zone, apiBase string) *DnsTarget {
 // JSON records of the whole zone. Results are paginated (pageSize 100):
 // a zone with more records than one page would otherwise silently hide
 // its later entries — exactly the A record this feature needs.
-func (d *DnsTarget) listRecords() ([]json.RawMessage, error) {
+func (d *DNSTarget) listRecords() ([]json.RawMessage, error) {
 	const pageSize = 100
 	const maxPages = 10 // 1000 records — plenty for a DDNS zone, and a
 	//                    hard stop against a misbehaving API.
@@ -215,7 +215,7 @@ func QueryBaiduDNSIP(accessKey, secretKey, zone, sub string) (string, error) {
 // explicit API base URL. It exists so tests can point at a mock server
 // without touching the production constant.
 func QueryBaiduDNSIPWithBase(accessKey, secretKey, zone, sub, apiBase string) (string, error) {
-	target := NewDnsTarget(accessKey, secretKey, zone, apiBase)
+	target := NewDNSTarget(accessKey, secretKey, zone, apiBase)
 	records, err := target.listRecords()
 	if err != nil {
 		return "", err

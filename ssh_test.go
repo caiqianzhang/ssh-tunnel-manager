@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -35,9 +38,6 @@ func TestFlushDNS(t *testing.T) {
 
 func TestSSHManagerLifecycle(t *testing.T) {
 	mgr := NewSSHManager()
-	if mgr.IsRunning("test") {
-		t.Error("expected not running for nonexistent connection")
-	}
 
 	// Test GetStatus for nonexistent connection
 	status := mgr.GetStatus("nonexistent")
@@ -50,34 +50,6 @@ func TestSSHManagerLifecycle(t *testing.T) {
 	if exists {
 		t.Error("expected no connection for nonexistent ID")
 	}
-
-	// Test GetActiveConnections on empty manager
-	active := mgr.GetActiveConnections()
-	if len(active) != 0 {
-		t.Errorf("expected 0 active connections, got %d", len(active))
-	}
-}
-
-func TestFormatSSHCommand(t *testing.T) {
-	cfg := ForwardConfig{
-		ID:            "test-1",
-		Name:          "Test Tunnel",
-		RemoteHost:    "remote.example.com",
-		RemotePort:    8080,
-		LocalHost:     "localhost",
-		LocalPort:     3000,
-		SSHUser:       "testuser",
-		AutoReconnect: true,
-		MaxRetries:    5,
-		RetryInterval: 10,
-	}
-
-	cmd := FormatSSHCommand(cfg)
-	if cmd == "" {
-		t.Fatal("expected non-empty SSH command")
-	}
-
-	t.Logf("SSH command: %s", cmd)
 }
 
 func TestSSHManagerDisconnectNonexistent(t *testing.T) {
@@ -280,8 +252,8 @@ func TestAttachPasswordPipe(t *testing.T) {
 	// The password must be readable from the pipe (with EOF).
 	buf := make([]byte, len(password)+1)
 	n, err := read.Read(buf)
-	if err != nil && err.Error() != "EOF" {
-		// io.EOF is expected; accept either.
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Errorf("pipe read: unexpected error: %v", err)
 	}
 	if n != len(password) || string(buf[:n]) != password {
 		t.Errorf("pipe read = %q, want %q", string(buf[:n]), password)
@@ -765,6 +737,72 @@ func TestDDNSHeartbeatKillsProcessOnIPChange(t *testing.T) {
 	}
 }
 
+// TestDDNSHeartbeatFallbackResolverDetectsIPChange verifies the
+// heartbeat also works WITHOUT Baidu credentials: freshIPs then falls
+// back to ResolveHost, and a CurrentIP that is no longer in the fresh
+// set must kill the process. Before the fallback existed, a server IP
+// change on hosts without baidu.key went unnoticed until the SSH
+// keepalive killed a tunnel that was already forwarding into a black
+// hole. The system resolver is selected (dnsResolver = "") so
+// "localhost" resolves from /etc/hosts without network access; the
+// tunnel's CurrentIP uses a TEST-NET address that can never appear in
+// the fresh set.
+func TestDDNSHeartbeatFallbackResolverDetectsIPChange(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: requires process signals")
+	}
+
+	clearBaiduCredsForTest(t)
+
+	oldResolver := dnsResolver
+	dnsResolver = ""
+	t.Cleanup(func() { dnsResolver = oldResolver })
+
+	mgr := NewSSHManager()
+	mgr.ddnsCheckInterval = 50 * time.Millisecond
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	conn := &SSHConn{
+		Config: ForwardConfig{
+			ID: "hb-fallback", RemoteHost: "localhost", RemotePort: 22,
+			LocalHost: "127.0.0.1", LocalPort: 0, SSHUser: "u",
+		},
+		Status:    "running",
+		CurrentIP: "203.0.113.7",
+		StopCh:    make(chan struct{}),
+		Process:   cmd,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.startDDNSMonitor("hb-fallback", conn, "localhost", 0)
+		close(done)
+	}()
+
+	exited := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback resolver heartbeat did not kill the process on IP change")
+	}
+
+	mgr.mu.RLock()
+	marked := conn.DDNSRestart
+	mgr.mu.RUnlock()
+	if !marked {
+		t.Error("expected DDNSRestart flag to be set before killing the process")
+	}
+}
+
 // ---------- resolveConnectTarget (startup DDNS fast-path) ----------
 
 // TestBuildSSHCommandUsesResolvedHost pins the connect-target contract:
@@ -796,20 +834,29 @@ func TestBuildSSHCommandUsesResolvedHost(t *testing.T) {
 }
 
 // TestResolveConnectTargetFallsBackWithoutCreds verifies the fallback
-// path: with no Baidu credentials the configured hostname is kept and
-// resolved through ordinary DNS.
+// path: with no Baidu credentials the host is resolved through the
+// configured resolver and the RESOLVED IP — not the hostname — becomes
+// the connect target. Letting ssh re-resolve the hostname would send it
+// back through the local system resolver, the stale cache the fallback
+// resolver exists to bypass. The system resolver is selected
+// (dnsResolver = "") so "localhost" resolves from /etc/hosts without
+// network access.
 func TestResolveConnectTargetFallsBackWithoutCreds(t *testing.T) {
 	clearBaiduCredsForTest(t)
+
+	oldResolver := dnsResolver
+	dnsResolver = ""
+	t.Cleanup(func() { dnsResolver = oldResolver })
 
 	host, ip, err := resolveConnectTarget("localhost")
 	if err != nil {
 		t.Fatalf("resolveConnectTarget failed: %v", err)
 	}
-	if host != "localhost" {
-		t.Errorf("expected host to stay 'localhost', got %q", host)
+	if net.ParseIP(host) == nil {
+		t.Errorf("expected the resolved IP as connect host, got %q", host)
 	}
-	if ip == "" {
-		t.Error("expected a resolved IP for localhost")
+	if host != ip {
+		t.Errorf("expected host == ip, got host=%q ip=%q", host, ip)
 	}
 }
 

@@ -118,7 +118,7 @@ func (ui *UI) settingsSection(gtx layout.Context) layout.Dimensions {
 
 // updateHeroStatus recomputes the hero status each frame.
 func (ui *UI) updateHeroStatus() {
-	status := ui.ssh.GetStatus(getFirstForwardID(ui.config))
+	status := ui.ssh.GetStatus(currentForwardID(ui.config))
 
 	// Bug 2 / 18: clear stale test results when connection state
 	// changes. The "正在连接..." messages used to stick around forever
@@ -151,10 +151,8 @@ func (ui *UI) updateHeroStatus() {
 // ─── Hero status (compact tinted card) ───────────────────────
 
 func (ui *UI) renderHeroStatus(gtx layout.Context) layout.Dimensions {
-	forwards := ui.config.GetForwards()
 	addr := "未配置转发规则"
-	if len(forwards) > 0 {
-		fwd := forwards[0]
+	if fwd, ok := ui.config.GetForward(); ok {
 		addr = fmt.Sprintf("%s:%d → %s:%d", fwd.LocalHost, fwd.LocalPort, fwd.RemoteHost, fwd.RemotePort)
 	}
 
@@ -207,7 +205,7 @@ func (ui *UI) renderActionRow(gtx layout.Context) layout.Dimensions {
 	return layout.Flex{Axis: layout.Horizontal, Spacing: 8}.Layout(gtx,
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 			return ui.toggleBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				status := ui.ssh.GetStatus(getFirstForwardID(ui.config))
+				status := ui.ssh.GetStatus(currentForwardID(ui.config))
 				running := status == "running"
 				text := "连接"
 				bg, fg := ColorBlue, ColorOnAccent

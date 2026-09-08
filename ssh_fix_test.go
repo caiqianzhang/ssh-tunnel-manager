@@ -19,7 +19,7 @@ func TestBuildSSHCommand_RemoteForwardUsesLocalHost(t *testing.T) {
 		RemoteHost:  "server.example.com",
 		SSHUser:     "alice",
 	}
-	formatted := FormatSSHCommandForType(cfg)
+	formatted := "ssh " + strings.Join(sshArgs(cfg, ""), " ")
 	if !strings.Contains(formatted, "192.168.1.5") {
 		t.Errorf("remote forward must include LocalHost as destination; got: %s", formatted)
 	}
@@ -39,7 +39,7 @@ func TestBuildSSHCommand_LocalForwardKeeps127(t *testing.T) {
 		RemoteHost:  "server.example.com",
 		SSHUser:     "alice",
 	}
-	formatted := FormatSSHCommandForType(cfg)
+	formatted := "ssh " + strings.Join(sshArgs(cfg, ""), " ")
 	if !strings.Contains(formatted, "127.0.0.1") {
 		t.Errorf("local forward must use 127.0.0.1 (loopback on server); got: %s", formatted)
 	}

@@ -28,12 +28,20 @@ var secretKeyDir = appDataDir
 // loadOrCreateSecretKey returns a 32-byte AES-256 key, creating a
 // new one if none exists. The key lives in the per-user data
 // directory (see paths.go) — deliberately NOT next to config.json.
+//
+// On first run in the new layout a legacy secret.key from the
+// executable directory is migrated in (same contract as config.json);
+// without this a legacy user would get a fresh key generated and
+// every stored password would become undecryptable.
 func loadOrCreateSecretKey() ([]byte, error) {
 	dir, err := secretKeyDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve secret key dir: %w", err)
 	}
 	keyPath := filepath.Join(dir, "secret.key")
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		migrateFile("secret.key", keyPath)
+	}
 	data, err := os.ReadFile(keyPath)
 	if err == nil {
 		if len(data) != 32 {
@@ -146,4 +154,3 @@ func IsEncrypted(cipherText string) bool {
 // minCiphertextLen is the shortest valid AES-GCM ciphertext: 12-byte nonce
 // plus 16-byte auth tag.
 const minCiphertextLen = 28
-

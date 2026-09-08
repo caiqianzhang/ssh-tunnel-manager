@@ -194,15 +194,14 @@ func main() {
 		shutdown(fmt.Sprintf("signal %v", sig))
 	}()
 
-	// trayConnect connects the first forward from the tray. If the
-	// local port is taken it surfaces the conflict dialog instead.
+	// trayConnect connects the configured forward from the tray. If
+	// the local port is taken it surfaces the conflict dialog instead.
 	trayConnect := func() {
 		go func() {
-			forwards := cfg.GetForwards()
-			if len(forwards) == 0 {
+			fwd, ok := cfg.GetForward()
+			if !ok {
 				return
 			}
-			fwd := forwards[0]
 			// Don't fight our own tunnel: while it is connecting, its
 			// ssh process already binds the local port, so a naive
 			// port check would flag our own socket as a conflict and
@@ -254,7 +253,7 @@ func main() {
 	go RunSystray(TrayCallbacks{
 		ShowCh:     showCh,
 		QuitCh:     quitCh,
-		Status:     func() string { return sshMgr.GetStatus(getFirstForwardID(cfg)) },
+		Status:     func() string { return sshMgr.GetStatus(currentForwardID(cfg)) },
 		Connect:    trayConnect,
 		Disconnect: func() { sshMgr.DisconnectAll() },
 	})
@@ -337,11 +336,9 @@ func runAppLoop(showReq chan struct{}, cfg *ConfigManager, sshMgr *SSHManager) {
 		// Window is gone: wait for a show signal. Quitting is handled
 		// by the dedicated quit goroutine in main and exits the whole
 		// process, so it never reaches this loop.
-		select {
-		case <-showReq:
-			Log("runAppLoop: restoring window from tray")
-			needWindow = true
-		}
+		<-showReq
+		Log("runAppLoop: restoring window from tray")
+		needWindow = true
 	}
 }
 
@@ -370,13 +367,12 @@ func quitProcess() {
 
 func autoConnect(cfg *ConfigManager, sshMgr *SSHManager, ui *UI) {
 	Log("autoConnect: starting")
-	forwards := cfg.GetForwards()
-	if len(forwards) == 0 {
-		Log("autoConnect: no forwards configured, skipping")
+	fwd, ok := cfg.GetForward()
+	if !ok {
+		Log("autoConnect: no forward configured, skipping")
 		return
 	}
 
-	fwd := forwards[0]
 	Logf("autoConnect: attempting to connect forward '%s' (local port %d)",
 		fwd.Name, fwd.LocalPort)
 
