@@ -463,9 +463,15 @@ func TestLoadConfigToFormDoesNotMislead(t *testing.T) {
 
 // TestUIEventLoop tests the event loop can be started.
 func TestUIEventLoop(t *testing.T) {
+	// A real OS window needs a graphical session: on a headless CI
+	// runner the Gio backend has nothing to attach to, so skip instead
+	// of failing (or hanging) there.
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		t.Skip("no graphical session: the window event loop needs a display")
+	}
+
 	w := new(app.Window)
 	w.Option(app.Size(100, 100))
-
 	cfg := NewConfigManager("test_config.json")
 	sshMgr := NewSSHManager()
 	ui := NewUI(cfg, sshMgr)
