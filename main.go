@@ -121,13 +121,9 @@ func main() {
 	}
 	sshMgr := NewSSHManager()
 
-	// The DDNS heartbeat period can be tuned from the config file
-	// (settings.ddns_check_interval, seconds); 0/unset keeps the
-	// built-in default of 15s.
-	if s := cfg.GetDDNSCheckInterval(); s > 0 {
-		sshMgr.SetDDNSCheckInterval(time.Duration(s) * time.Second)
-		Logf("DDNS probe interval set to %ds from config", s)
-	}
+	// Push config-file settings into the runtime BEFORE any tunnel can
+	// start (autoConnect fires as soon as the window is created).
+	applyConfigSettings(cfg, sshMgr)
 
 	// Repaint immediately on tunnel status transitions instead of
 	// waiting for the next interaction-driven frame; surface terminal
@@ -363,6 +359,22 @@ func quitProcess() {
 	removeRuntimeSocket()
 	CloseLogger()
 	os.Exit(0)
+}
+
+// applyConfigSettings syncs config-file settings that the runtime reads
+// from package-level state: the DDNS heartbeat period onto the SSH
+// manager, and the fallback DNS resolver onto the ssh package var (see
+// SetDNSResolver; "" = use the system resolver). Called once at startup
+// before autoConnect. Without the resolver sync a resolver value
+// hand-edited into config.json was ignored for the first connect — the
+// built-in default (119.29.29.29) coinciding with the config default
+// masked the gap until the next save from the settings UI.
+func applyConfigSettings(cfg *ConfigManager, sshMgr *SSHManager) {
+	if s := cfg.GetDDNSCheckInterval(); s > 0 {
+		sshMgr.SetDDNSCheckInterval(time.Duration(s) * time.Second)
+		Logf("DDNS probe interval set to %ds from config", s)
+	}
+	SetDNSResolver(cfg.GetDNSResolver())
 }
 
 func autoConnect(cfg *ConfigManager, sshMgr *SSHManager, ui *UI) {

@@ -7,7 +7,59 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestApplyConfigSettingsSyncsRuntime pins the startup wiring: the DDNS
+// heartbeat period must reach the SSH manager and the fallback DNS
+// resolver must reach the ssh package var BEFORE the first (auto-)
+// connect. Previously the resolver was only applied by a save from the
+// settings UI, so a value hand-edited into config.json was silently
+// ignored on startup.
+func TestApplyConfigSettingsSyncsRuntime(t *testing.T) {
+	oldResolver := dnsResolver
+	t.Cleanup(func() { dnsResolver = oldResolver })
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfgJSON := `{"forward":{"id":"f","name":"d","forward_type":"local","remote_host":"r","remote_port":22,"local_host":"l","local_port":2222,"ssh_user":"u"},"settings":{"ddns_check_interval":7,"dns_resolver":"1.1.1.1"}}`
+	if err := os.WriteFile(path, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cm := NewConfigManager(path)
+	if err := cm.Load(); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewSSHManager()
+
+	applyConfigSettings(cm, mgr)
+
+	if dnsResolver != "1.1.1.1" {
+		t.Errorf("expected config resolver 1.1.1.1 to be applied, got %q", dnsResolver)
+	}
+	if mgr.ddnsCheckInterval != 7*time.Second {
+		t.Errorf("expected DDNS interval 7s, got %v", mgr.ddnsCheckInterval)
+	}
+
+	// An empty resolver means "use the system resolver" and must pass
+	// through as-is, not be replaced by the built-in default; an unset
+	// DDNS interval must be left alone (no override, no reset).
+	emptyPath := filepath.Join(t.TempDir(), "empty.json")
+	if err := os.WriteFile(emptyPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cm2 := NewConfigManager(emptyPath)
+	if err := cm2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewSSHManager()
+	applyConfigSettings(cm2, fresh)
+	if dnsResolver != "" {
+		t.Errorf("expected empty config resolver to select the system resolver, got %q", dnsResolver)
+	}
+	if fresh.ddnsCheckInterval != time.Duration(DefaultDDNSIntervalSeconds)*time.Second {
+		t.Errorf("unset DDNS interval must keep the built-in default, got %v", fresh.ddnsCheckInterval)
+	}
+}
 
 // TestQuitProcessExitsAndCleansUp pins the tray-quit contract: the
 // process must actually terminate (app.Main blocks forever by design,
