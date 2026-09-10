@@ -53,22 +53,45 @@ make test
 
 Windows 构建为 best-effort：单实例锁、端口占用的进程识别与结束、
 域名解析优化均依赖 Linux 工具（flock/unix socket、ss/fuser/lsof、
-pkexec + resolvectl），在 Windows 上不可用或降级。
+pkexec + resolvectl），在 Windows 上不可用或降级。运行方式：直接
+双击 exe 即可；密码认证依赖 `sshpass`（Windows 无对应实现），请改用
+SSH 密钥认证。
 
 构建时将版本号（git describe）注入二进制；设置页面会显示它。可选的
 运行时辅助程序会被自动检测：`pkexec` + `resolvectl` 驱动设置中的
 域名解析优化行。
 
-### 桌面集成（可选，Linux）
+### 运行与安装（Linux 桌面）
+
+应用是单个自包含的二进制：配置、密钥、日志全部存放在用户目录
+（`~/.config`、`~/.local/share`、`~/.cache`），与二进制放在哪里无关，
+因此**直接运行就是完整功能**，下面的安装只是可选的桌面集成：
 
 ```sh
-sudo make install     # 二进制 -> /usr/local/bin + 菜单项 + 图标
+chmod +x ssh-tunnel-manager
+./ssh-tunnel-manager    # 托盘常驻；关窗口收到托盘，退出走托盘菜单
 ```
 
-此后应用从桌面菜单启动，带自己的图标。卸载方式：删除
-`/usr/local/bin/ssh-tunnel-manager`、`/usr/local/bin/querydns`，以及
-`/usr/local/share/applications/` 和 `/usr/local/share/icons/` 下的
-ssh-tunnel-manager 条目。
+想要桌面菜单图标，按喜好三选一：
+
+```sh
+# Ubuntu/Debian：.deb 包走包管理器（GitHub 发布页提供，amd64/arm64）
+sudo apt install ./ssh-tunnel-manager_<版本>_<架构>.deb
+
+# 每用户安装（无需 root）
+mkdir -p ~/.local/bin ~/.local/share/applications \
+         ~/.local/share/icons/hicolor/128x128/apps
+cp ssh-tunnel-manager ~/.local/bin/
+cp ssh-tunnel-manager.desktop ~/.local/share/applications/
+cp ssh-tunnel-manager.png \
+   ~/.local/share/icons/hicolor/128x128/apps/ssh-tunnel-manager.png
+
+# 从源码构建的系统级安装
+sudo make install       # 二进制 -> /usr/local/bin + 菜单项 + 图标
+```
+
+卸载方式：.deb 用 `sudo apt remove ssh-tunnel-manager`；手动安装则
+删除对应目录里的 `ssh-tunnel-manager`、`querydns` 条目即可。
 
 ## 配置
 

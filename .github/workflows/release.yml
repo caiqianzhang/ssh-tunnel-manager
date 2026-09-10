@@ -73,6 +73,31 @@ jobs:
             go build -ldflags "$ldflags" \
             -o "dist/querydns-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" ./cmd/querydns
 
+      # Package the Linux binaries as a .deb so Ubuntu/Debian users can
+      # `sudo apt install ./ssh-tunnel-manager_...deb` — binary, menu
+      # entry and icon installed and removed through the package
+      # manager. dpkg-deb runs on the native runner, so amd64 and arm64
+      # each get a matching package.
+      - name: Build .deb package
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          arch="${{ matrix.goarch }}"
+          version="${GITHUB_REF_NAME#v}"
+          stage=deb-pkg
+          mkdir -p "$stage/DEBIAN" \
+                   "$stage/usr/bin" \
+                   "$stage/usr/share/applications" \
+                   "$stage/usr/share/icons/hicolor/128x128/apps"
+          sed -e "s/__VERSION__/$version/" -e "s/__ARCH__/$arch/" \
+              packaging/debian-control.in > "$stage/DEBIAN/control"
+          install -Dm755 "dist/ssh-tunnel-manager-${{ matrix.goos }}-${arch}" "$stage/usr/bin/ssh-tunnel-manager"
+          install -Dm755 "dist/querydns-${{ matrix.goos }}-${arch}" "$stage/usr/bin/querydns"
+          install -Dm644 packaging/ssh-tunnel-manager.desktop "$stage/usr/share/applications/ssh-tunnel-manager.desktop"
+          install -Dm644 packaging/icon.png "$stage/usr/share/icons/hicolor/128x128/apps/ssh-tunnel-manager.png"
+          dpkg-deb --root-owner-group --build "$stage" \
+            "dist/ssh-tunnel-manager_${version}_${arch}.deb"
+
       # Upload this platform's binaries so the release job can collect
       # them all into one GitHub Release.
       - name: Upload artifacts
@@ -99,6 +124,7 @@ jobs:
           mkdir -p release
           find dist -type f -name 'ssh-tunnel-manager-*' -exec cp {} release/ \;
           find dist -type f -name 'querydns-*' -exec cp {} release/ \;
+          find dist -type f -name '*.deb' -exec cp {} release/ \;
           ls -l release/
 
       - name: Create GitHub Release

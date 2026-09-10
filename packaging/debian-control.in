@@ -1,0 +1,17 @@
+Package: ssh-tunnel-manager
+Version: __VERSION__
+Section: net
+Priority: optional
+Architecture: __ARCH__
+Maintainer: caiqianzhang <caiqianzhang@users.noreply.github.com>
+Depends: openssh-client
+Recommends: sshpass
+Description: SSH tunnel manager with a DDNS fast-path (SSH 隧道管理器)
+ Tray application that manages SSH local/remote port forwards through
+ a plain ssh process (known_hosts/agent keep working). With Baidu
+ Cloud DNS credentials (baidu.key, optional) the server IP is resolved
+ authoritatively on connect and a heartbeat restarts the tunnel when
+ the IP changes; without it a configurable public DNS server is used
+ as the fallback resolver. Config lives in
+ ~/.config/ssh-tunnel-manager/, SSH passwords are stored
+ AES-256-GCM-encrypted.

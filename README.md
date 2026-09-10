@@ -59,22 +59,50 @@ The Windows build is best-effort: single-instance enforcement,
 port-conflict process identification/killing, and the DNS
 zone-forwarding feature all rely on Linux tooling (flock/unix
 sockets, ss/fuser/lsof, pkexec + resolvectl) that is unavailable or
-degraded on Windows.
+degraded on Windows. To run it, just double-click the exe; password
+authentication relies on `sshpass` (no Windows equivalent), so use
+SSH key authentication instead.
 
 The build stamps the version (git describe) into the binary; the
 settings page shows it. Optional runtime helpers are auto-detected:
 `pkexec` + `resolvectl` power the 域名解析优化 row in settings.
 
-### Desktop integration (optional, Linux)
+### Running & installing (Linux desktop)
+
+The app is a single self-contained binary: config, keys and logs all
+live in the user's home directories (`~/.config`, `~/.local/share`,
+`~/.cache`), independent of where the binary sits — so **running it
+directly is fully functional**; the installs below are optional
+desktop integration:
 
 ```sh
-sudo make install     # binary to /usr/local/bin + menu entry + icon
+chmod +x ssh-tunnel-manager
+./ssh-tunnel-manager    # tray app; closing the window hides to tray,
+                        # quit from the tray menu
 ```
 
-Afterwards the app starts from the desktop menu with its own icon.
-Uninstall by removing `/usr/local/bin/ssh-tunnel-manager`,
-`/usr/local/bin/querydns`, and the ssh-tunnel-manager entries under
-`/usr/local/share/applications` and `/usr/local/share/icons`.
+For a desktop menu entry, pick one:
+
+```sh
+# Ubuntu/Debian: install the .deb through the package manager
+# (provided on the GitHub Releases page, amd64/arm64)
+sudo apt install ./ssh-tunnel-manager_<version>_<arch>.deb
+
+# Per-user install (no root needed)
+mkdir -p ~/.local/bin ~/.local/share/applications \
+         ~/.local/share/icons/hicolor/128x128/apps
+cp ssh-tunnel-manager ~/.local/bin/
+cp ssh-tunnel-manager.desktop ~/.local/share/applications/
+cp ssh-tunnel-manager.png \
+   ~/.local/share/icons/hicolor/128x128/apps/ssh-tunnel-manager.png
+
+# System-wide install from source
+sudo make install       # binary -> /usr/local/bin + menu entry + icon
+```
+
+Uninstall with `sudo apt remove ssh-tunnel-manager` for the .deb, or
+by deleting the `ssh-tunnel-manager` / `querydns` entries from the
+corresponding directories for the manual installs.
 
 ## Configuration
 
