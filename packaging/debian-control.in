@@ -4,7 +4,18 @@ Section: net
 Priority: optional
 Architecture: __ARCH__
 Maintainer: caiqianzhang <caiqianzhang@users.noreply.github.com>
-Depends: openssh-client
+Depends: openssh-client,
+ libegl1,
+ libgl1,
+ libwayland-client0,
+ libwayland-cursor0,
+ libwayland-egl1,
+ libx11-6,
+ libx11-xcb1,
+ libxcursor1,
+ libxfixes3,
+ libxkbcommon-x11-0,
+ libxkbcommon0
 Recommends: sshpass
 Description: SSH tunnel manager with a DDNS fast-path (SSH 隧道管理器)
  Tray application that manages SSH local/remote port forwards through
