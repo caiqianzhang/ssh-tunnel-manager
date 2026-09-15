@@ -35,3 +35,12 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # Input-pipeline smoke test: clicks the real binary under Xvfb.
+      # Catches "renders but never delivers clicks" bugs (missing
+      # widget.Layout hit area) that unit tests and vet cannot see.
+      - name: Install smoke test tools
+        run: sudo apt-get install -y -qq xvfb xdotool x11-utils
+
+      - name: Smoke test
+        run: make smoke

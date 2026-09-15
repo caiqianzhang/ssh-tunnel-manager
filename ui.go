@@ -313,6 +313,7 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 	// own tag). Per-field paste buttons were removed as redundant.
 
 	if _, ok := ui.settingsToggle.Update(gtx); ok {
+		Log("settings: header clicked")
 		ui.settingsExpanded = !ui.settingsExpanded
 		if ui.settingsExpanded {
 			// Always reveal the top of the page (status card + action
@@ -330,6 +331,7 @@ func (ui *UI) handleEvents(gtx layout.Context) {
 		// which avoids the clip/resize race entirely.
 	}
 	if _, ok := ui.toggleBtn.Update(gtx); ok {
+		Log("toggle: connect button clicked")
 		ui.toggleConnection()
 	}
 	if _, ok := ui.testBtn.Update(gtx); ok {
