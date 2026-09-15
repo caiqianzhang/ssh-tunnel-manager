@@ -79,9 +79,7 @@ func (ui *UI) versionRow(gtx layout.Context) layout.Dimensions {
 }
 
 func (ui *UI) settingsSaveBtn(gtx layout.Context) layout.Dimensions {
-	return ui.saveBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return ui.drawRoundedBtn(gtx, &ui.saveBtn, "保存设置", ColorBlue, ColorOnAccent)
-	})
+	return ui.drawRoundedBtn(gtx, &ui.saveBtn, "保存设置", ColorBlue, ColorOnAccent)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -161,7 +159,12 @@ func (ui *UI) filledEditor(gtx layout.Context, editor *widget.Editor) layout.Dim
 	)
 }
 
-// drawRoundedBtn renders a flat filled rounded-rect button.
+// drawRoundedBtn renders a flat filled rounded-rect button AND
+// registers its clickable hit area via btn.Layout. It intentionally
+// bundles the two: a button that only paints (the old contract) looks
+// identical but never delivers clicks — a bug that shipped in the
+// zone-forward 启用 button and was invisible to every static check.
+// Do NOT wrap this in another btn.Layout call.
 func (ui *UI) drawRoundedBtn(gtx layout.Context, btn *widget.Clickable, text string, bg, fg color.NRGBA) layout.Dimensions {
 	const btnH = 36
 
@@ -170,22 +173,25 @@ func (ui *UI) drawRoundedBtn(gtx layout.Context, btn *widget.Clickable, text str
 		w = 200
 	}
 	h := gtx.Dp(btnH)
-	gtx.Constraints = layout.Exact(image.Pt(w, h))
 
-	if btn.Hovered() {
-		bg = ColorBlueDark
-	}
+	return btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints = layout.Exact(image.Pt(w, h))
 
-	defer clip.UniformRRect(image.Rect(0, 0, w, h), h/2).Push(gtx.Ops).Pop()
-	paint.Fill(gtx.Ops, bg)
+		if btn.Hovered() {
+			bg = ColorBlueDark
+		}
 
-	layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		lbl := material.Body2(ui.theme, text)
-		lbl.Color = fg
-		lbl.Font.Weight = font.Bold
-		return lbl.Layout(gtx)
+		defer clip.UniformRRect(image.Rect(0, 0, w, h), h/2).Push(gtx.Ops).Pop()
+		paint.Fill(gtx.Ops, bg)
+
+		layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Body2(ui.theme, text)
+			lbl.Color = fg
+			lbl.Font.Weight = font.Bold
+			return lbl.Layout(gtx)
+		})
+		return layout.Dimensions{Size: image.Pt(w, h)}
 	})
-	return layout.Dimensions{Size: image.Pt(w, h)}
 }
 
 // ─── Scrollable Container with Visible Scrollbar ─────────────────
