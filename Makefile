@@ -1,4 +1,4 @@
-.PHONY: build build-linux build-windows build-deb install clean test
+.PHONY: build build-linux build-windows build-deb install clean test smoke
 
 # Build outputs go to build/ so the project root stays clean — only
 # source files live at the top level.
@@ -25,7 +25,9 @@ build-linux:
 
 build-windows:
 	mkdir -p $(BUILD_DIR)
-	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/ssh-tunnel-manager.exe .
+	# -H=windowsgui: without it double-clicking the exe also opens a
+	# console window alongside the GUI.
+	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS) -H=windowsgui" -o $(BUILD_DIR)/ssh-tunnel-manager.exe .
 	GOOS=windows GOARCH=amd64 go build -o $(BUILD_DIR)/querydns.exe ./cmd/querydns
 
 # build-deb: package the Linux binaries into a .deb so recipients can
@@ -64,3 +66,10 @@ clean:
 
 test:
 	go test -v ./...
+
+# smoke: end-to-end input-pipeline test — runs the real binary under
+# Xvfb and clicks it with xdotool, so "renders but never delivers
+# clicks" bugs (the zone-forward 启用 button) cannot ship again.
+# Needs the xvfb, xdotool and x11-utils packages installed.
+smoke: build
+	./test/smoke.sh

@@ -64,7 +64,12 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           ldflags="-s -w -X main.appVersion=${version}"
           suffix=""
-          if [ "${{ matrix.goos }}" = "windows" ]; then suffix=".exe"; fi
+          # -H=windowsgui: no console window next to the GUI when the
+          # exe is double-clicked.
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            suffix=".exe"
+            ldflags="$ldflags -H=windowsgui"
+          fi
 
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -ldflags "$ldflags" \
