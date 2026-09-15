@@ -144,6 +144,13 @@ func (ui *UI) filledEditor(gtx layout.Context, editor *widget.Editor) layout.Dim
 		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 			return layout.Inset{Top: 9, Bottom: 9, Left: 10, Right: 10}.Layout(gtx,
 				func(gtx layout.Context) layout.Dimensions {
+					// The editor's click/target area is its laid-out
+					// size, and with an empty field that collapses to a
+					// 1px caret sliver — clicks anywhere else never
+					// focus the field, making it impossible to start
+					// typing. Force the editor to fill the padded box so
+					// the whole input is clickable.
+					gtx.Constraints.Min = gtx.Constraints.Max
 					ed := material.Editor(ui.theme, editor, "")
 					ed.HintColor = ColorGray
 					ed.TextSize = unit.Sp(14)
