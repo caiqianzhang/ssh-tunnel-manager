@@ -481,6 +481,12 @@ func TestAutoReconnectUsesBaiduDNS(t *testing.T) {
 		return exec.Command("sleep", "30")
 	}
 
+	// Stub the pre-connection TCP dial: the DDNS test uses a mock IP
+	// (10.99.88.77) that is not actually routable.
+	origDial := dialTargetFunc
+	dialTargetFunc = func(ip string, port int) error { return nil }
+	t.Cleanup(func() { dialTargetFunc = origDial })
+
 	// 4. Forward config: auto-reconnect enabled.
 	cfg := ForwardConfig{
 		ID:            "e2e-ddns",

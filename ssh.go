@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -576,6 +577,38 @@ func resolveConnectTarget(remoteHost string) (host, ip string, err error) {
 	return ips[0], ips[0], nil
 }
 
+// sshPort is the port ssh itself connects to: buildCmd never passes -p,
+// so the SSH endpoint is always the server's port 22 — NOT
+// ForwardConfig.RemotePort, which for a local (-L) forward names a
+// server-side service that may be loopback-only and unreachable from
+// the client directly.
+const sshPort = 22
+
+// dialTargetFunc verifies that the remote SSH endpoint is reachable via
+// TCP before we fork an SSH process. This is the safety net behind
+// monitorProcess's 1.5 s confirmation window: without it an unreachable
+// host (SYN dropped) lets ssh sit in the kernel's TCP retry cycle for up
+// to ConnectTimeout (10 s), during which monitorProcess has already
+// marked the tunnel "running" — a false-positive that drives the UI's
+// connect/disconnect/reconnect loop.
+//
+// The 2 s timeout is generous enough to survive transient network
+// queuing but short enough to keep the UI responsive; it is checked
+// BEFORE cmd.Start(), so a dead host fails fast instead of being
+// reported as a phantom "running" tunnel.
+//
+// Package-level so tests can stub it (the DDNS test uses a mock IP that
+// is not actually routable).
+var dialTargetFunc = func(ip string, port int) error {
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("TCP dial to %s failed: %v", addr, err)
+	}
+	conn.Close()
+	return nil
+}
+
 // Connect starts an SSH tunnel with the given configuration.
 //
 // Connect-target resolution happens outside the manager lock so a slow
@@ -598,6 +631,20 @@ func (m *SSHManager) Connect(cfg ForwardConfig) error {
 	hostToUse, ip, err := resolveConnectTarget(cfg.RemoteHost)
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote host: %v", err)
+	}
+
+	// Pre-connection TCP check: catch unreachable hosts before forking
+	// ssh. Dial the SSH endpoint (port 22), not RemotePort — for a
+	// local (-L) forward RemotePort names a server-side service
+	// (often loopback-only), and dialing it from here would refuse
+	// every connect with "connection refused" even though the tunnel
+	// itself would work fine. Without this check, ssh sits in the
+	// kernel's SYN retry cycle for up to ConnectTimeout (10 s) while
+	// monitorProcess's 1.5 s window has already marked the tunnel
+	// "running" — the false-positive that drives the
+	// connect/disconnect/reconnect loop.
+	if err := dialTargetFunc(ip, sshPort); err != nil {
+		return fmt.Errorf("target %s:%d unreachable: %v", ip, sshPort, err)
 	}
 
 	cmd := m.buildCmd(cfg, hostToUse)
